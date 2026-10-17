@@ -1,0 +1,509 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Criar projeto
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_MB'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ManaBot"
+          include(":app")
+          EOF_MB
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_MB'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_MB
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_MB'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          kotlin.code.style=official
+          EOF_MB
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_MB'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.manabot"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.manabot"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_MB
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_MB'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Mana Bot"
+                  android:icon="@android:drawable/ic_media_play"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CaptureService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".BotAccessibilityService"
+                      android:exported="true"
+                      android:label="Mana Bot (toque)"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_MB
+          mkdir -p $(dirname app/src/main/res/xml/accessibility_service_config.xml)
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF_MB'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:canPerformGestures="true"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100" />
+          EOF_MB
+          mkdir -p $(dirname app/src/main/res/values/strings.xml)
+          cat > app/src/main/res/values/strings.xml <<'EOF_MB'
+          <resources>
+              <string name="a11y_desc">Usado apenas para segurar e soltar a tela no puzzle Mana Control.</string>
+          </resources>
+          EOF_MB
+          mkdir -p $(dirname app/src/main/java/com/manabot/Detector.kt)
+          cat > app/src/main/java/com/manabot/Detector.kt <<'EOF_MB'
+          package com.manabot
+
+          import java.nio.ByteBuffer
+
+          /**
+           * Lê UMA linha horizontal (3 linhas médias) passando pelo centro do círculo e acha:
+           *  - T: círculo fino mais externo (borda do disco de mana — é ele que você controla:
+           *       segurar encolhe, soltar expande);
+           *  - R: anel grosso (duas bordas) mais externo, que vira dourado quando "acerta".
+           * Medido nos seus vídeos: o anel fica dourado ~90% das vezes quando T - R está entre ~38 e ~58 px
+           * (em frame de 1068 px de largura).
+           */
+          object Detector {
+              class Reading(val t: Float, val r: Float, val gold: Boolean)
+              private class Run(val c: Float, val w: Int, val gold: Boolean)
+
+              const val FRAME_W = 1068
+
+              fun analyze(
+                  buf: ByteBuffer, rowStride: Int, pixStride: Int, w: Int, h: Int,
+                  cxFrac: Float, cyFrac: Float
+              ): Reading? {
+                  val cx = (cxFrac * w).toInt()
+                  val cy = (cyFrac * h).toInt().coerceIn(1, h - 2)
+                  val rmax = 140
+                  if (cx - rmax < 0 || cx + rmax >= w) return null
+                  val ts = ArrayList<Float>(2); val rs = ArrayList<Float>(2); var gold = false
+                  for (sgn in intArrayOf(-1, 1)) {
+                      val n = rmax - 8
+                      val bright = BooleanArray(n); val gd = BooleanArray(n)
+                      for (i in 0 until n) {
+                          val x = cx + sgn * (i + 8)
+                          var rr = 0; var gg = 0; var bb = 0
+                          for (dy in -1..1) {
+                              val o = (cy + dy) * rowStride + x * pixStride
+                              rr += buf.get(o).toInt() and 255
+                              gg += buf.get(o + 1).toInt() and 255
+                              bb += buf.get(o + 2).toInt() and 255
+                          }
+                          rr /= 3; gg /= 3; bb /= 3
+                          val isGold = rr > 200 && gg > 140 && bb < 120
+                          gd[i] = isGold
+                          bright[i] = isGold || minOf(rr, gg, bb) > 190
+                      }
+                      val runs = ArrayList<Run>()
+                      var i = 0
+                      while (i < n) {
+                          if (bright[i]) {
+                              var j = i
+                              while (j + 1 < n && bright[j + 1]) j++
+                              var g = false
+                              for (k in i..j) if (gd[k]) g = true
+                              runs.add(Run((i + j) / 2f + 8f, j - i + 1, g))
+                              i = j + 1
+                          } else i++
+                      }
+                      var t = -1f; var r = -1f; var g = false
+                      for (run in runs) {
+                          if (run.w <= 2 && run.c in 20f..132f && run.c > t) t = run.c
+                          if (run.w >= 3 && run.c in 20f..125f) { if (run.c > r) r = run.c; if (run.gold) g = true }
+                      }
+                      if (t > 0 && r > 0) { ts.add(t); rs.add(r); gold = gold || g }
+                  }
+                  if (ts.isEmpty()) return null
+                  return Reading(ts.average().toFloat(), rs.average().toFloat(), gold)
+              }
+          }
+          EOF_MB
+          mkdir -p $(dirname app/src/main/java/com/manabot/Controller.kt)
+          cat > app/src/main/java/com/manabot/Controller.kt <<'EOF_MB'
+          package com.manabot
+
+          /**
+           * Objetivo: manter  gap = T - R  perto de targetGap (anel dourado).
+           * Medido nos vídeos: SEGURAR => T encolhe (~-6 px/s), SOLTAR => T expande (~+5 px/s); R quase não reage.
+           * Então: gap acima do alvo => segurar; abaixo => soltar. Usa derivada para antecipar (lead).
+           * "SURGE" só muda a deriva de T; o controle em malha fechada compensa sozinho.
+           */
+          class Controller {
+              var targetGap = 48f
+              var leadSec = 0.12f
+              private var hold = false
+              private var lastGap = Float.NaN
+              private var lastT = 0L
+              private var dGap = 0f
+              private var lastSeen = 0L
+              var lastError = 0f; private set
+
+              fun update(rd: Detector.Reading?, now: Long): Boolean {
+                  if (rd == null) {
+                      if (now - lastSeen > 250) hold = false   // sem leitura: solta (deixa expandir)
+                      return hold
+                  }
+                  lastSeen = now
+                  val gap = rd.t - rd.r
+                  if (!lastGap.isNaN() && now > lastT) {
+                      val d = (gap - lastGap) / ((now - lastT) / 1000f)
+                      dGap = 0.6f * dGap + 0.4f * d.coerceIn(-80f, 80f)
+                  }
+                  lastGap = gap; lastT = now
+                  val e = gap + leadSec * dGap - targetGap
+                  lastError = e
+                  if (e > 1.5f) hold = true else if (e < -1.5f) hold = false
+                  return hold
+              }
+
+              fun reset() { hold = false; lastGap = Float.NaN; dGap = 0f }
+          }
+          EOF_MB
+          mkdir -p $(dirname app/src/main/java/com/manabot/BotAccessibilityService.kt)
+          cat > app/src/main/java/com/manabot/BotAccessibilityService.kt <<'EOF_MB'
+          package com.manabot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.accessibilityservice.GestureDescription.StrokeDescription
+          import android.graphics.Path
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+
+          /** Segura/solta a tela encadeando traços contínuos (continueStroke). */
+          class BotAccessibilityService : AccessibilityService() {
+              companion object {
+                  @Volatile var instance: BotAccessibilityService? = null
+                  private const val SEG_MS = 40L
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private var stroke: StrokeDescription? = null
+              private var busy = false
+              @Volatile private var wantHold = false
+              var x = 0f; var y = 0f
+
+              override fun onServiceConnected() { instance = this }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() { setHold(false) }
+              override fun onDestroy() { instance = null; super.onDestroy() }
+
+              fun setHold(h: Boolean) { wantHold = h; main.post { pump() } }
+
+              private fun path(): Path = Path().apply { moveTo(x, y) }
+
+              private fun pump() {
+                  if (busy) return
+                  val s = stroke
+                  val next: StrokeDescription = when {
+                      s == null && wantHold -> StrokeDescription(path(), 0, SEG_MS, true)
+                      s != null && wantHold -> s.continueStroke(path(), 0, SEG_MS, true)
+                      s != null && !wantHold -> s.continueStroke(path(), 0, 1, false)
+                      else -> return
+                  }
+                  val ending = !next.willContinue()
+                  busy = true
+                  val ok = dispatchGesture(
+                      GestureDescription.Builder().addStroke(next).build(),
+                      object : GestureResultCallback() {
+                          override fun onCompleted(g: GestureDescription?) {
+                              stroke = if (ending) null else next
+                              busy = false; pump()
+                          }
+                          override fun onCancelled(g: GestureDescription?) {
+                              stroke = null; busy = false; pump()
+                          }
+                      }, null
+                  )
+                  if (!ok) { busy = false; stroke = null }
+                  else if (!ending) stroke = next
+              }
+          }
+          EOF_MB
+          mkdir -p $(dirname app/src/main/java/com/manabot/CaptureService.kt)
+          cat > app/src/main/java/com/manabot/CaptureService.kt <<'EOF_MB'
+          package com.manabot
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.widget.TextView
+
+          class CaptureService : Service() {
+              private var projection: MediaProjection? = null
+              private var vd: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private lateinit var thread: HandlerThread
+              private val controller = Controller()
+              private var overlay: TextView? = null
+              private var wm: WindowManager? = null
+              @Volatile private var enabled = false
+              private var lastCfg = 0L
+              private var cx = 0.499f; private var cy = 0.498f
+              private var tx = 0.68f; private var ty = 0.60f
+              private var frames = 0; private var lastUi = 0L
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("mana", "Mana Bot", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "mana").setContentTitle("Mana Bot ativo")
+                      .setSmallIcon(android.R.drawable.ic_media_play).build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+
+                  val code = intent?.getIntExtra("code", 0) ?: 0
+                  val data = intent?.getParcelableExtra<Intent>("data")
+                  if (data == null) { stopSelf(); return START_NOT_STICKY }
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data)
+                  thread = HandlerThread("mana-cap").also { it.start() }
+                  val handler = Handler(thread.looper)
+                  projection!!.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() { stopSelf() }
+                  }, handler)
+
+                  // Sempre paisagem: lado maior = largura. Em retrato o conteúdo aparece pequeno até o Roblox girar a tela.
+                  val dm = resources.displayMetrics
+                  val long = maxOf(dm.widthPixels, dm.heightPixels).toFloat()
+                  val short = minOf(dm.widthPixels, dm.heightPixels).toFloat()
+                  val w = Detector.FRAME_W
+                  val h = (w * short / long).toInt()
+                  reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  vd = projection!!.createVirtualDisplay(
+                      "mana", w, h, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      reader!!.surface, null, handler
+                  )
+                  reader!!.setOnImageAvailableListener({ r -> onFrame(r, w, h) }, handler)
+                  showOverlay()
+                  return START_NOT_STICKY
+              }
+
+              private fun loadCfg() {
+                  val p = getSharedPreferences("cfg", MODE_PRIVATE)
+                  controller.targetGap = p.getFloat("gap", 48f)
+                  controller.leadSec = p.getFloat("lead", 120f) / 1000f
+                  cx = p.getFloat("cx", 49.9f) / 100f; cy = p.getFloat("cy", 49.8f) / 100f
+                  tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
+              }
+
+              private fun onFrame(r: ImageReader, w: Int, h: Int) {
+                  val img = r.acquireLatestImage() ?: return
+                  try {
+                      val now = SystemClock.uptimeMillis()
+                      if (now - lastCfg > 700) { loadCfg(); lastCfg = now }
+                      val pl = img.planes[0]
+                      val rd = Detector.analyze(pl.buffer, pl.rowStride, pl.pixelStride, w, h, cx, cy)
+                      val svc = BotAccessibilityService.instance
+                      val hold: Boolean
+                      if (enabled) {
+                          hold = controller.update(rd, now)
+                          val dm = resources.displayMetrics
+                          val lw = maxOf(dm.widthPixels, dm.heightPixels); val lh = minOf(dm.widthPixels, dm.heightPixels)
+                          svc?.x = tx * lw; svc?.y = ty * lh
+                          svc?.setHold(hold)
+                      } else { hold = false; controller.reset(); svc?.setHold(false) }
+                      frames++
+                      if (now - lastUi > 150) {
+                          lastUi = now
+                          val txt = (if (enabled) "ON " else "OFF") + (if (svc == null) " (sem acessib.)" else "") +
+                              if (rd != null) " T=%.0f R=%.0f gap=%.0f %s%s".format(rd.t, rd.r, rd.t - rd.r,
+                                  if (hold) "SEGURA" else "solta", if (rd.gold) " *" else "") else " sem leitura"
+                          overlay?.post { overlay?.text = txt }
+                      }
+                  } finally { img.close() }
+              }
+
+              private fun showOverlay() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val tv = TextView(this).apply {
+                      text = "OFF"; textSize = 11f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xCC222222.toInt())
+                      setPadding(16, 10, 16, 10)
+                  }
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = 200; y = 120 }
+                  var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+                  tv.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              if (Math.abs(e.rawX - sx) > 12 || Math.abs(e.rawY - sy) > 12) moved = true
+                              if (moved) { lp.x = ox + (e.rawX - sx).toInt(); lp.y = oy + (e.rawY - sy).toInt(); wm?.updateViewLayout(tv, lp) }
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) { enabled = !enabled }   // toque = liga/desliga
+                      }
+                      true
+                  }
+                  try { wm!!.addView(tv, lp); overlay = tv } catch (e: Exception) { stopSelf() }
+              }
+
+              override fun onDestroy() {
+                  BotAccessibilityService.instance?.setHold(false)
+                  overlay?.let { wm?.removeView(it) }
+                  vd?.release(); reader?.close(); projection?.stop()
+                  if (::thread.isInitialized) thread.quitSafely()
+                  super.onDestroy()
+              }
+          }
+          EOF_MB
+          mkdir -p $(dirname app/src/main/java/com/manabot/MainActivity.kt)
+          cat > app/src/main/java/com/manabot/MainActivity.kt <<'EOF_MB'
+          package com.manabot
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private val REQ = 42
+              private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 40, 40, 40) }
+                  fun label(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, 24, 0, 4) }
+                  fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+                  root.addView(TextView(this).apply {
+                      text = "Mana Bot — Mana Control\n1) acessibilidade  2) sobreposição  3) iniciar captura. " +
+                          "Abra o Roblox no puzzle e toque na caixinha flutuante para ligar/desligar. Arraste para mover."
+                  })
+                  root.addView(btn("1. Ativar serviço de acessibilidade") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
+                  root.addView(btn("2. Permitir sobreposição") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  })
+                  root.addView(btn("3. Iniciar captura + caixinha") {
+                      if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                      val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      startActivityForResult(mpm.createScreenCaptureIntent(), REQ)
+                  })
+                  root.addView(btn("Parar") { startService(Intent(this, CaptureService::class.java).setAction("STOP")) })
+
+                  fun slider(name: String, key: String, min: Float, max: Float, def: Float, unit: String) {
+                      val v = prefs.getFloat(key, def)
+                      val tv = label("$name: ${"%.1f".format(v)}$unit")
+                      val sb = SeekBar(this).apply {
+                          this.max = 200; progress = (((v - min) / (max - min)) * 200).toInt()
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                                  val nv = min + (max - min) * p / 200f
+                                  prefs.edit().putFloat(key, nv).apply(); tv.text = "$name: ${"%.1f".format(nv)}$unit"
+                              }
+                              override fun onStartTrackingTouch(s: SeekBar?) {}
+                              override fun onStopTrackingTouch(s: SeekBar?) {}
+                          })
+                      }
+                      root.addView(tv); root.addView(sb)
+                  }
+                  slider("Gap alvo (T-R)", "gap", 30f, 70f, 48f, " px")
+                  slider("Antecipação", "lead", 0f, 300f, 120f, " ms")
+                  slider("Centro do círculo X", "cx", 44f, 56f, 49.9f, " %")
+                  slider("Centro do círculo Y", "cy", 44f, 56f, 49.8f, " %")
+                  slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
+                  slider("Ponto de toque Y", "ty", 45f, 80f, 60f, " %")
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(rq: Int, rc: Int, data: Intent?) {
+                  super.onActivityResult(rq, rc, data)
+                  if (rq == REQ && rc == RESULT_OK && data != null) {
+                      startForegroundService(Intent(this, CaptureService::class.java).putExtra("code", rc).putExtra("data", data))
+                      Toast.makeText(this, "Abra o Roblox e toque na caixinha para ligar", Toast.LENGTH_LONG).show()
+                  }
+              }
+          }
+          EOF_MB
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.9 }
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with: { name: ManaBot-apk, path: app/build/outputs/apk/debug/app-debug.apk }
