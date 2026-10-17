@@ -120,7 +120,8 @@ jobs:
            * (em frame de 1068 px de largura).
            */
           object Detector {
-              class Reading(val t: Float, val r: Float, val gold: Boolean)
+              /** ring = anel grosso (mana, controlado); inner/outer = círculos finos da zona (ou NaN) */
+              class Reading(val ring: Float, val inner: Float, val outer: Float, val gold: Boolean)
               private class Run(val c: Float, val w: Int, val gold: Boolean)
 
               const val FRAME_W = 1068
@@ -133,7 +134,7 @@ jobs:
                   val cy = (cyFrac * h).toInt().coerceIn(1, h - 2)
                   val rmax = 140
                   if (cx - rmax < 0 || cx + rmax >= w) return null
-                  val ts = ArrayList<Float>(2); val rs = ArrayList<Float>(2); var gold = false
+                  val rg = ArrayList<Float>(2); val ins = ArrayList<Float>(2); val outs = ArrayList<Float>(2); var gold = false
                   for (sgn in intArrayOf(-1, 1)) {
                       val n = rmax - 8
                       val bright = BooleanArray(n); val gd = BooleanArray(n)
@@ -163,15 +164,28 @@ jobs:
                               i = j + 1
                           } else i++
                       }
-                      var t = -1f; var r = -1f; var g = false
-                      for (run in runs) {
-                          if (run.w <= 2 && run.c in 20f..132f && run.c > t) t = run.c
-                          if (run.w >= 3 && run.c in 20f..125f) { if (run.c > r) r = run.c; if (run.gold) g = true }
-                      }
-                      if (t > 0 && r > 0) { ts.add(t); rs.add(r); gold = gold || g }
+                      // anel: run grosso mais externo (+ a borda interna, se for o par de bordas)
+                      val thick = runs.filter { it.w >= 3 && it.c in 20f..128f }
+                      if (thick.isEmpty()) continue
+                      val outerThick = thick.maxByOrNull { it.c }!!
+                      val inner = thick.filter { it !== outerThick && outerThick.c - it.c <= 10f }.maxByOrNull { it.c }
+                      val ringC = if (inner != null) (outerThick.c + inner.c) / 2f else outerThick.c
+                      val g = thick.any { it.gold }
+                      // círculos finos da zona: o mais próximo abaixo e o mais próximo acima do anel
+                      val thin = runs.filter { it.w <= 2 && it.c in 14f..133f && Math.abs(it.c - ringC) > 6f }
+                      val lo = thin.filter { it.c < ringC }.maxByOrNull { it.c }?.c
+                      val hi = thin.filter { it.c > ringC }.minByOrNull { it.c }?.c
+                      rg.add(ringC); gold = gold || g
+                      if (lo != null && ringC - lo <= 60f) ins.add(lo)
+                      if (hi != null && hi - ringC <= 60f) outs.add(hi)
                   }
-                  if (ts.isEmpty()) return null
-                  return Reading(ts.average().toFloat(), rs.average().toFloat(), gold)
+                  if (rg.isEmpty()) return null
+                  return Reading(
+                      rg.average().toFloat(),
+                      if (ins.isEmpty()) Float.NaN else ins.average().toFloat(),
+                      if (outs.isEmpty()) Float.NaN else outs.average().toFloat(),
+                      gold
+                  )
               }
           }
           EOF_MB
@@ -180,40 +194,46 @@ jobs:
           package com.manabot
 
           /**
-           * Objetivo: manter  gap = T - R  perto de targetGap (anel dourado).
-           * Medido nos vídeos: SEGURAR => T encolhe (~-6 px/s), SOLTAR => T expande (~+5 px/s); R quase não reage.
-           * Então: gap acima do alvo => segurar; abaixo => soltar. Usa derivada para antecipar (lead).
-           * "SURGE" só muda a deriva de T; o controle em malha fechada compensa sozinho.
+           * O anel grosso (R) é a mana: SEGURAR encolhe, SOLTAR expande (confirmado no teste real).
+           * A zona estável é a faixa entre dois círculos finos (I < O). Fica dourado quando o anel está dentro.
+           * Objetivo: manter R na posição `zonePos` (0=círculo interno, 1=externo) entre I e O.
+           * Zona que encolhe/expande e os "SURGE" só mudam o alvo ou a deriva: o laço fechado compensa.
            */
           class Controller {
-              var targetGap = 48f
-              var leadSec = 0.12f
+              var zonePos = 0.5f
+              var leadSec = 0.08f
               private var hold = false
-              private var lastGap = Float.NaN
+              private var lastR = Float.NaN
               private var lastT = 0L
-              private var dGap = 0f
+              private var dR = 0f
               private var lastSeen = 0L
-              var lastError = 0f; private set
+              var target = Float.NaN; private set
 
               fun update(rd: Detector.Reading?, now: Long): Boolean {
                   if (rd == null) {
-                      if (now - lastSeen > 250) hold = false   // sem leitura: solta (deixa expandir)
+                      if (now - lastSeen > 250) hold = false
                       return hold
                   }
                   lastSeen = now
-                  val gap = rd.t - rd.r
-                  if (!lastGap.isNaN() && now > lastT) {
-                      val d = (gap - lastGap) / ((now - lastT) / 1000f)
-                      dGap = 0.6f * dGap + 0.4f * d.coerceIn(-80f, 80f)
+                  val hasI = !rd.inner.isNaN(); val hasO = !rd.outer.isNaN()
+                  target = when {
+                      hasI && hasO -> rd.inner + zonePos * (rd.outer - rd.inner)
+                      hasO -> rd.outer - 10f
+                      hasI -> rd.inner + 10f
+                      else -> Float.NaN
                   }
-                  lastGap = gap; lastT = now
-                  val e = gap + leadSec * dGap - targetGap
-                  lastError = e
+                  if (!lastR.isNaN() && now > lastT) {
+                      val d = (rd.ring - lastR) / ((now - lastT) / 1000f)
+                      dR = 0.6f * dR + 0.4f * d.coerceIn(-120f, 120f)
+                  }
+                  lastR = rd.ring; lastT = now
+                  if (target.isNaN()) return hold          // sem referência: mantém o último comando
+                  val e = rd.ring + leadSec * dR - target
                   if (e > 1.5f) hold = true else if (e < -1.5f) hold = false
                   return hold
               }
 
-              fun reset() { hold = false; lastGap = Float.NaN; dGap = 0f }
+              fun reset() { hold = false; lastR = Float.NaN; dR = 0f }
           }
           EOF_MB
           mkdir -p $(dirname app/src/main/java/com/manabot/BotAccessibilityService.kt)
@@ -357,8 +377,8 @@ jobs:
 
               private fun loadCfg() {
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
-                  controller.targetGap = p.getFloat("gap", 48f)
-                  controller.leadSec = p.getFloat("lead", 120f) / 1000f
+                  controller.zonePos = p.getFloat("gap", 50f) / 100f
+                  controller.leadSec = p.getFloat("lead", 80f) / 1000f
                   cx = p.getFloat("cx", 49.9f) / 100f; cy = p.getFloat("cy", 49.8f) / 100f
                   tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
               }
@@ -383,7 +403,7 @@ jobs:
                       if (now - lastUi > 150) {
                           lastUi = now
                           val txt = (if (enabled) "ON " else "OFF") + (if (svc == null) " (sem acessib.)" else "") +
-                              if (rd != null) " T=%.0f R=%.0f gap=%.0f %s%s".format(rd.t, rd.r, rd.t - rd.r,
+                              if (rd != null) " R=%.0f I=%.0f O=%.0f alvo=%.0f %s%s".format(rd.ring, rd.inner, rd.outer, controller.target,
                                   if (hold) "SEGURA" else "solta", if (rd.gold) " *" else "") else " sem leitura"
                           overlay?.post { overlay?.text = txt }
                       }
@@ -480,8 +500,8 @@ jobs:
                       }
                       root.addView(tv); root.addView(sb)
                   }
-                  slider("Gap alvo (T-R)", "gap", 30f, 70f, 48f, " px")
-                  slider("Antecipação", "lead", 0f, 300f, 120f, " ms")
+                  slider("Posição na zona (0=interno, 100=externo)", "gap", 0f, 100f, 50f, " %")
+                  slider("Antecipação", "lead", 0f, 300f, 80f, " ms")
                   slider("Centro do círculo X", "cx", 44f, 56f, 49.9f, " %")
                   slider("Centro do círculo Y", "cy", 44f, 56f, 49.8f, " %")
                   slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
