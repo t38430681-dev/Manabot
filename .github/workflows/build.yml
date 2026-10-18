@@ -2,8 +2,6 @@ name: Build APK
 on: [push, workflow_dispatch]
 jobs:
   build:
-    permissions:
-      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +25,6 @@ jobs:
           cat > gradle.properties <<'EOF_MB'
           org.gradle.jvmargs=-Xmx2g
           android.useAndroidX=true
-          android.nonTransitiveRClass=true
           kotlin.code.style=official
           EOF_MB
           mkdir -p $(dirname app/build.gradle.kts)
@@ -43,12 +40,16 @@ jobs:
                   applicationId = "com.manabot"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0-review"
               }
               buildTypes { release { isMinifyEnabled = false } }
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
               kotlinOptions { jvmTarget = "17" }
+              testOptions { unitTests.isReturnDefaultValues = true }
+          }
+          dependencies {
+              testImplementation("junit:junit:4.13.2")
           }
           EOF_MB
           mkdir -p $(dirname app/src/main/AndroidManifest.xml)
@@ -59,24 +60,24 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
+          
               <application
                   android:label="Mana Bot"
                   android:icon="@android:drawable/ic_media_play"
                   android:theme="@android:style/Theme.DeviceDefault.Light">
-
+          
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
-
+          
                   <service
                       android:name=".CaptureService"
                       android:exported="false"
                       android:foregroundServiceType="mediaProjection" />
-
+          
                   <service
                       android:name=".BotAccessibilityService"
                       android:exported="true"
@@ -111,372 +112,253 @@ jobs:
           mkdir -p $(dirname app/src/main/java/com/manabot/Detector.kt)
           cat > app/src/main/java/com/manabot/Detector.kt <<'EOF_MB'
           package com.manabot
-
+          
           import java.nio.ByteBuffer
-          import kotlin.math.roundToInt
-
+          
           /**
-           * Lê três linhas horizontais perto do centro e estima os raios:
-           *  - ring: anel grosso controlado (segurar encolhe, soltar expande);
-           *  - inner/outer: bordas finas da faixa-alvo;
-           *  - gold: indica que pixels dourados foram vistos em parte do anel grosso.
-           * Os raios são estimativas em pixels do quadro redimensionado para 1068 px de largura.
+           * Lê UMA linha horizontal (3 linhas médias) passando pelo centro do círculo e acha:
+           *  - T: círculo fino mais externo (borda do disco de mana — é ele que você controla:
+           *       segurar encolhe, soltar expande);
+           *  - R: anel grosso (duas bordas) mais externo, que vira dourado quando "acerta".
+           * Medido nos seus vídeos: o anel fica dourado ~90% das vezes quando T - R está entre ~38 e ~58 px
+           * (em frame de 1068 px de largura).
            */
           object Detector {
-              const val FRAME_W = 1068
-              const val MIN_R = 8
-              const val MAX_R = 150
-
-              class Reading(
-                  val ring: Float,
-                  val inner: Float,
-                  val outer: Float,
-                  val gold: Boolean,
-                  val centerX: Float,
-                  val centerY: Float
-              )
-
-              private data class Run(val c: Float, val w: Int, val score: Float, val gold: Boolean)
-              private var cachedX = -1
-              private var cachedY = -1
-              private var lastLocateNs = 0L
-
-              // Um Int compactado evita dezenas de milhares de pequenas alocações por frame.
-              private fun pixel(buf: ByteBuffer, rowStride: Int, pixStride: Int, x: Int, y: Int): Int {
-                  val o = y * rowStride + x * pixStride
-                  val r = buf.get(o).toInt() and 255
-                  val g = buf.get(o + 1).toInt() and 255
-                  val b = buf.get(o + 2).toInt() and 255
-                  return (r shl 16) or (g shl 8) or b
-              }
-              private fun pr(p: Int) = (p ushr 16) and 255
-              private fun pg(p: Int) = (p ushr 8) and 255
-              private fun pb(p: Int) = p and 255
-
-              private fun isRingPixel(r: Int, g: Int, b: Int): Boolean {
-                  val white = minOf(r, g, b) >= 185 && maxOf(r, g, b) - minOf(r, g, b) <= 90
-                  val pinkWhite = r >= 205 && g >= 145 && b >= 175
-                  val gold = r >= 185 && g >= 105 && r - g >= 35 && b <= 165
-                  return white || pinkWhite || gold
-              }
-
-              private fun isGoldPixel(r: Int, g: Int, b: Int): Boolean =
-                  r >= 185 && g >= 105 && r - g >= 35 && b <= 165
-
               /**
-               * Procura o centro real do conjunto de círculos. A versão anterior usava um X/Y fixo
-               * (67,5% / 51%), que não corresponde ao centro visível nos frames enviados. Aqui o
-               * centro informado pelo usuário é apenas o ponto inicial; a simetria circular pode corrigi-lo.
+               * ring  = anel grosso (a mana que você controla); NaN se não achou
+               * inner/outer = os dois círculos finos da zona (separados ~30-46 px); NaN se não achou
                */
-              private fun locateCenter(
-                  buf: ByteBuffer, rowStride: Int, pixStride: Int, w: Int, h: Int,
-                  seedX: Int, seedY: Int
-              ): Triple<Int, Int, Float> {
-                  var bestX = seedX
-                  var bestY = seedY
-                  var best = -1f
-                  val radii = intArrayOf(28, 40, 55, 72, 92, 115)
-                  val angles = 12
-                  val maxDx = minOf(96, w / 8)
-                  val maxDy = minOf(72, h / 8)
-                  for (dy in -maxDy..maxDy step 8) {
-                      val cy = (seedY + dy).coerceIn(MAX_R + 2, h - MAX_R - 3)
-                      for (dx in -maxDx..maxDx step 8) {
-                          val cx = (seedX + dx).coerceIn(MAX_R + 2, w - MAX_R - 3)
-                          var score = 0f
-                          var pairs = 0
-                          for (ri in radii.indices) {
-                              val rr = radii[ri]
-                              for (a in 0 until angles / 2) {
-                                  val t = (a * 2.0 * Math.PI / angles)
-                                  val cs = kotlin.math.cos(t).toFloat()
-                                  val sn = kotlin.math.sin(t).toFloat()
-                                  val x1 = (cx + rr * cs).toInt().coerceIn(0, w - 1)
-                                  val y1 = (cy + rr * sn).toInt().coerceIn(0, h - 1)
-                                  val x2 = (cx - rr * cs).toInt().coerceIn(0, w - 1)
-                                  val y2 = (cy - rr * sn).toInt().coerceIn(0, h - 1)
-                                  val p1 = pixel(buf, rowStride, pixStride, x1, y1)
-                                  val p2 = pixel(buf, rowStride, pixStride, x2, y2)
-                                  val b1 = isRingPixel(pr(p1), pg(p1), pb(p1))
-                                  val b2 = isRingPixel(pr(p2), pg(p2), pb(p2))
-                                  if (b1 && b2) score += 2f
-                                  else if (b1 || b2) score += 0.25f
-                                  pairs++
-                              }
-                          }
-                          score /= pairs.coerceAtLeast(1)
-                          // Penaliza deslocamentos muito grandes para evitar escolher outra estrutura simétrica.
-                          score -= 0.0008f * (dx * dx + dy * dy)
-                          if (score > best) { best = score; bestX = cx; bestY = cy }
-                      }
-                  }
-                  val confidence = (best / 2f).coerceIn(0f, 1f)
-                  return Triple(bestX, bestY, confidence)
-              }
-
+              class Reading(val ring: Float, val inner: Float, val outer: Float, val gold: Boolean, val confidence: Float = 0f, val centerX: Float = Float.NaN, val centerY: Float = Float.NaN)
+              private class Run(val c: Float, val w: Int, val gold: Boolean)
+          
+              const val FRAME_W = 1068
+          
               fun analyze(
                   buf: ByteBuffer, rowStride: Int, pixStride: Int, w: Int, h: Int,
-                  cxFrac: Float, cyFrac: Float, prevRing: Float = Float.NaN, prevWidth: Float = Float.NaN
+                  cxFrac: Float, cyFrac: Float, prevMid: Float = Float.NaN, prevRing: Float = Float.NaN
               ): Reading? {
-                  val seedX = (cxFrac * w).toInt().coerceIn(MAX_R + 2, w - MAX_R - 3)
-                  val seedY = (cyFrac * h).toInt().coerceIn(MAX_R + 2, h - MAX_R - 3)
-                  val nowNs = System.nanoTime()
-                  val needLocate = cachedX < 0 || nowNs - lastLocateNs > 250_000_000L ||
-                      kotlin.math.abs(cachedX - seedX) > 42 || kotlin.math.abs(cachedY - seedY) > 42
-                  if (needLocate) {
-                      val located = locateCenter(buf, rowStride, pixStride, w, h, seedX, seedY)
-                      cachedX = located.first
-                      cachedY = located.second
-                      lastLocateNs = nowNs
-                  }
-                  val cx = cachedX
-                  val cy = cachedY
-
-                  // Perfil radial: várias direções, não apenas três linhas horizontais.
-                  val angles = 24
-                  val hits = IntArray(MAX_R + 1)
-                  val goldHits = IntArray(MAX_R + 1)
-                  for (r in MIN_R..MAX_R) {
-                      var count = 0
-                      var gold = 0
-                      for (a in 0 until angles) {
-                          val t = 2.0 * Math.PI * a / angles
-                          val x = (cx + r * kotlin.math.cos(t)).toInt().coerceIn(0, w - 1)
-                          val y = (cy + r * kotlin.math.sin(t)).toInt().coerceIn(0, h - 1)
-                          val p = pixel(buf, rowStride, pixStride, x, y)
-                          val rr = pr(p); val gg = pg(p); val bb = pb(p)
-                          if (isRingPixel(rr, gg, bb)) count++
-                          if (isGoldPixel(rr, gg, bb)) gold++
-                      }
-                      hits[r] = count
-                      goldHits[r] = gold
-                  }
-
-                  // Suaviza o perfil para tolerar pequenas quebras causadas por brilho/textura.
-                  val smooth = IntArray(MAX_R + 1)
-                  for (r in MIN_R..MAX_R) {
-                      smooth[r] = ((hits.getOrElse(r - 1) { 0 } + hits[r] + hits.getOrElse(r + 1) { 0 }) / 3f).roundToInt()
-                  }
-
-                  val runs = ArrayList<Run>()
-                  var r = MIN_R
-                  while (r <= MAX_R) {
-                      if (smooth[r] >= 5) {
-                          val begin = r
-                          var total = 0f
-                          var n = 0
-                          while (r <= MAX_R && smooth[r] >= 5) {
-                              total += smooth[r]
-                              n++
-                              r++
+                  val cx = (cxFrac * w).toInt()
+                  val cy = (cyFrac * h).toInt().coerceIn(1, h - 2)
+                  val rmax = 140
+                  if (cx - rmax < 0 || cx + rmax >= w) return null
+                  val rg = ArrayList<Float>(2); val ins = ArrayList<Float>(2); val outs = ArrayList<Float>(2); var gold = false
+                  for (sgn in intArrayOf(-1, 1)) {
+                      val n = rmax - 8
+                      val bright = BooleanArray(n); val gd = BooleanArray(n)
+                      for (i in 0 until n) {
+                          val x = cx + sgn * (i + 8)
+                          var rr = 0; var gg = 0; var bb = 0
+                          for (dy in -1..1) {
+                              val o = (cy + dy) * rowStride + x * pixStride
+                              if (o < 0 || o + 2 >= buf.limit()) continue
+                              rr += buf.get(o).toInt() and 255
+                              gg += buf.get(o + 1).toInt() and 255
+                              bb += buf.get(o + 2).toInt() and 255
                           }
-                          val end = r - 1
-                          val center = (begin + end) / 2f
-                          val width = end - begin + 1
-                          val score = total / n.coerceAtLeast(1)
-                          val gold = (begin..end).any { goldHits[it] >= 5 }
-                          runs.add(Run(center, width, score, gold))
-                      } else r++
+                          rr /= 3; gg /= 3; bb /= 3
+                          val isGold = rr > 200 && gg > 140 && bb < 120
+                          val warm = rr > 215 && rr - gg > 55 && bb < 235   // anel laranja/vermelho/rosa
+                          gd[i] = isGold
+                          bright[i] = isGold || warm || minOf(rr, gg, bb) > 190
+                      }
+                      val runs = ArrayList<Run>()
+                      var i = 0
+                      while (i < n) {
+                          if (bright[i]) {
+                              var j = i
+                              while (j + 1 < n && bright[j + 1]) j++
+                              var g = false
+                              for (k in i..j) if (gd[k]) g = true
+                              runs.add(Run((i + j) / 2f + 8f, j - i + 1, g))
+                              i = j + 1
+                          } else i++
+                      }
+                      // anel grosso mais externo (+ borda interna do par)
+                      val thick = runs.filter { it.w >= 3 && it.c in 14f..128f }
+                      var ringC = Float.NaN
+                      if (thick.isNotEmpty()) {
+                          val chosen = if (prevRing.isFinite()) {
+                              val nearest = thick.minByOrNull { Math.abs(it.c - prevRing) }!!
+                              // Follow normal motion, but permit a large real radius jump during SURGE.
+                              if (Math.abs(nearest.c - prevRing) <= 24f) nearest else thick.maxByOrNull { it.c }!!
+                          } else thick.maxByOrNull { it.c }!!
+                          val paired = thick.filter { it !== chosen && Math.abs(it.c - chosen.c) <= 10f }
+                              .minByOrNull { Math.abs(it.c - chosen.c) }
+                          ringC = if (paired != null) (chosen.c + paired.c) / 2f else chosen.c
+                          rg.add(ringC)
+                          if (thick.any { it.gold && Math.abs(it.c - ringC) <= 8f }) gold = true
+                      }
+                      // zona = par de círculos finos separados ~28..46 px. Escolhe o par mais próximo da zona anterior
+                      // (a zona se move de forma contínua); sem histórico, o mais próximo do anel.
+                      val thin = runs.filter { it.w <= 2 && it.c in 14f..133f }.map { it.c }.sorted()
+                      var best: Pair<Float, Float>? = null; var bestScore = Float.MAX_VALUE
+                      for (a in thin.indices) for (b in a + 1 until thin.size) {
+                          val sep = thin[b] - thin[a]
+                          if (sep < 28f || sep > 46f) continue
+                          val mid = (thin[a] + thin[b]) / 2f
+                          val score = when {
+                              !prevMid.isNaN() -> Math.abs(mid - prevMid)
+                              !ringC.isNaN() -> Math.abs(mid - ringC)
+                              else -> -mid
+                          }
+                          if (score < bestScore) { bestScore = score; best = Pair(thin[a], thin[b]) }
+                      }
+                      if (best != null) { ins.add(best.first); outs.add(best.second) }
+                      else if (!ringC.isNaN()) {
+                          // sem par: um círculo só. Ignora o círculo fixo do pentagrama (~31 px).
+                          val lo = thin.filter { it < ringC - 6f && it > 40f }.maxOrNull()
+                          val hi = thin.filter { it > ringC + 6f }.minOrNull()
+                          if (lo != null && ringC - lo <= 45f) ins.add(lo)
+                          if (hi != null && hi - ringC <= 45f) outs.add(hi)
+                      }
                   }
-
-                  if (runs.isEmpty()) return null
-
-                  // Primeiro identificamos o anel controlado usando o histórico. Isso é importante
-                  // porque o círculo externo dourado do SURGE também é perfeitamente circular.
-                  val roughRingCandidates = runs.filter { it.w >= 2 && it.c in 45f..130f }
-                  val ringRun = if (!prevRing.isNaN() && roughRingCandidates.isNotEmpty()) {
-                      roughRingCandidates.minByOrNull { kotlin.math.abs(it.c - prevRing) - it.score * 0.04f }
-                  } else {
-                      roughRingCandidates.maxByOrNull { it.score - kotlin.math.abs(it.c - 115f) * 0.015f }
-                  }
-                  val ring = ringRun?.c ?: Float.NaN
-
-                  // A faixa-alvo é procurada em torno do anel. Em SURGE, uma das bordas pode
-                  // desaparecer visualmente; por isso uma borda forte + largura conhecida é válida.
-                  val widthGuess = if (!prevWidth.isNaN() && prevWidth in 28f..58f) prevWidth else 42f
-                  val outerCandidates = runs.filter { it.c in 45f..150f && (ring.isNaN() || it.c > ring + 8f) }
-                  val innerCandidates = runs.filter { it.c in 35f..145f && (ring.isNaN() || it.c < ring - 8f) }
-
-                  val outerRun = outerCandidates.maxByOrNull { it.score + it.c * 0.20f }
-                  val innerRun = innerCandidates.maxByOrNull { it.score + it.c * 0.008f }
-
-                  val inner: Float
-                  val outer: Float
-                  if (outerRun != null && innerRun != null && outerRun.c - innerRun.c in 24f..58f) {
-                      inner = innerRun.c
-                      outer = outerRun.c
-                  } else if (outerRun != null) {
-                      outer = outerRun.c
-                      inner = outer - widthGuess
-                  } else if (innerRun != null) {
-                      inner = innerRun.c
-                      outer = inner + widthGuess
-                  } else {
-                      inner = Float.NaN
-                      outer = Float.NaN
-                  }
-
-                  if (ring.isNaN() && inner.isNaN() && outer.isNaN()) return null
-                  val gold = ringRun?.gold == true || runs.any { it.gold && !ring.isNaN() && kotlin.math.abs(it.c - ring) < 8f }
-                  return Reading(ring, inner, outer, gold, cx.toFloat(), cy.toFloat())
+                  if (rg.isEmpty() && ins.isEmpty() && outs.isEmpty()) return null
+                  fun avg(l: List<Float>) = if (l.isEmpty()) Float.NaN else l.average().toFloat()
+                  val ring = avg(rg); val inner = avg(ins); val outer = avg(outs)
+                  val confidence = ((rg.size.coerceAtMost(2) + ins.size.coerceAtMost(2) + outs.size.coerceAtMost(2)) / 6f).coerceIn(0f, 1f)
+                  return Reading(ring, inner, outer, gold, confidence, cx.toFloat(), cy.toFloat())
               }
           }
           EOF_MB
           mkdir -p $(dirname app/src/main/java/com/manabot/Controller.kt)
           cat > app/src/main/java/com/manabot/Controller.kt <<'EOF_MB'
           package com.manabot
-
-          /**
-           * Controlador do anel. A posição da zona é medida pelo centro geométrico; a posição selecionada
-           * pelo slider só define o alvo. Assim, variações de largura da zona não viram velocidade falsa.
-           * O modelo de velocidade do anel é corrigido sempre que há uma leitura nova.
-           */
+          
+          import kotlin.math.abs
+          
+          /** Adaptive controller. Uses observed radius velocity and the measured capture/touch delay;
+           * avoids fixed, unverified acceleration constants and keeps the controlled ring inside the band. */
           class Controller {
-              companion object {
-                  const val SAFE = 3f
-                  const val BRAKE = 75f
-              }
-
               var zonePos = 0.5f
               var leadSec = 0.18f
-
               private var hold = false
-              private var r = Float.NaN
-              private var v = 0f
-              private var lastMeasuredR = Float.NaN
-              private var inner = Float.NaN
-              private var outer = Float.NaN
-              private var zoneWidth = Float.NaN
-              private var lastZoneChange = 0L
-              private var lastSeen = 0L
-              private var lastT = 0L
-              private var staleFrames = 0
-
-              var target = Float.NaN
-                  private set
-              val estimatedRing get() = r
-              val estimatedZoneWidth get() = zoneWidth
-
-
-              private fun resetPrediction(now: Long, measured: Float) {
-                  r = measured
-                  v = 0f
-                  lastMeasuredR = measured
-                  lastT = now
-              }
-
+              private var ring = Float.NaN
+              private var velocity = 0f
+              private var previousMeasurement = Float.NaN
+              private var targetInner = Float.NaN
+              private var targetOuter = Float.NaN
+              private var zoneMid = Float.NaN
+              private var zoneVelocity = 0f
+              private var previousZoneMid = Float.NaN
+              private var lastTime = 0L
+              private var lastZoneSeen = 0L
+              private var lastAnySeen = 0L
+              private var previousVelocity = 0f
+              private var estimatedAcceleration = 0f
+              var target = Float.NaN; private set
+              val estimatedRing get() = ring
+          
+              /** Return the geometric zone midpoint for detector association, not the slider target. */
+              fun currentMid(now: Long): Float = if (now - lastZoneSeen < 300) zoneMid else Float.NaN
+              fun currentRing(): Float = ring
+          
               fun update(rd: Detector.Reading?, now: Long): Boolean {
-                  val dt = if (lastT == 0L) 0.033f else ((now - lastT) / 1000f).coerceIn(0.008f, 0.12f)
-                  lastT = now
-
-                  // Primeiro, prevê somente o movimento do anel controlado.
-                  if (!r.isNaN()) {
-                      val accel = if (hold) -52f else 52f
-                      v = (v + (accel - 2.8f * v) * dt).coerceIn(-150f, 150f)
-                      r += v * dt
-                  }
-
-                  if (rd == null) {
-                      staleFrames++
-                  } else {
-                      staleFrames = 0
-
-                      if (!rd.ring.isNaN() && rd.ring in 15f..145f) {
-                          if (lastMeasuredR.isNaN()) {
-                              resetPrediction(now, rd.ring)
+                  val dt = if (lastTime == 0L) 1f / 30f else ((now - lastTime) / 1000f).coerceIn(0.008f, 0.12f)
+                  lastTime = now
+                  val oldVelocity = velocity
+          
+                  if (rd != null) {
+                      val hasRing = rd.ring.isFinite() && rd.ring > 8f && rd.ring < 145f
+                      val hasInner = rd.inner.isFinite() && rd.inner > 35f
+                      val hasOuter = rd.outer.isFinite() && rd.outer > 35f
+                      if (hasRing || hasInner || hasOuter) lastAnySeen = now
+          
+                      if (hasRing) {
+                          if (previousMeasurement.isFinite()) {
+                              val raw = ((rd.ring - previousMeasurement) / dt).coerceIn(-100f, 100f)
+                              velocity = 0.58f * velocity + 0.42f * raw
+                              val rawAccel = ((velocity - oldVelocity) / dt).coerceIn(-350f, 350f)
+                              estimatedAcceleration = 0.8f * estimatedAcceleration + 0.2f * rawAccel
                           } else {
-                              val measuredV = ((rd.ring - lastMeasuredR) / dt).coerceIn(-180f, 180f)
-                              // A medição manda; o modelo só suaviza ruído de 1-2 pixels.
-                              v = (0.72f * v + 0.28f * measuredV).coerceIn(-160f, 160f)
-                              r = rd.ring
-                              lastMeasuredR = rd.ring
+                              velocity = 0f
+                              estimatedAcceleration = 0f
                           }
-                      } else {
-                          lastMeasuredR = Float.NaN
+                          previousMeasurement = rd.ring
+                          ring = rd.ring
                       }
-
-                      if (!rd.inner.isNaN() && !rd.outer.isNaN()) {
-                          val ni = minOf(rd.inner, rd.outer)
-                          val no = maxOf(rd.inner, rd.outer)
-                          val nw = no - ni
-                          if (nw in 24f..60f) {
-                              val oldW = zoneWidth
-                              inner = ni
-                              outer = no
-                              zoneWidth = nw
-                              lastSeen = now
-                              if (!oldW.isNaN() && kotlin.math.abs(nw - oldW) > 8f) {
-                                  // SURGE: a faixa mudou de tamanho. Não transforme isso em velocidade da zona.
-                                  lastZoneChange = now
-                                  target = inner + zonePos.coerceIn(0f, 1f) * zoneWidth
-                              }
+          
+                      if (hasInner && hasOuter && rd.outer > rd.inner + 12f && rd.outer - rd.inner < 60f) {
+                          val newMid = (rd.inner + rd.outer) / 2f
+                          if (previousZoneMid.isFinite() && now - lastZoneSeen < 300) {
+                              val dz = ((newMid - previousZoneMid) / dt).coerceIn(-80f, 80f)
+                              // Sudden, plausible band shifts are allowed (SURGE); velocity is capped so a single
+                              // mis-detected frame cannot move the prediction hundreds of pixels.
+                              zoneVelocity = 0.65f * zoneVelocity + 0.35f * dz
+                          } else zoneVelocity = 0f
+                          previousZoneMid = newMid
+                          zoneMid = newMid
+                          targetInner = rd.inner
+                          targetOuter = rd.outer
+                          lastZoneSeen = now
+                      } else if (now - lastZoneSeen < 220L) {
+                          // One edge can disappear behind the avatar or effects. Reconstruct the missing edge
+                          // from the last valid width instead of swapping to a decorative circle.
+                          val oldWidth = if (targetInner.isFinite() && targetOuter.isFinite()) targetOuter - targetInner else Float.NaN
+                          if (oldWidth in 12f..60f && hasInner && !hasOuter) {
+                              targetInner = rd.inner
+                              targetOuter = rd.inner + oldWidth
+                              zoneMid = (targetInner + targetOuter) / 2f
+                              lastZoneSeen = now
+                          } else if (oldWidth in 12f..60f && hasOuter && !hasInner) {
+                              targetOuter = rd.outer
+                              targetInner = rd.outer - oldWidth
+                              zoneMid = (targetInner + targetOuter) / 2f
+                              lastZoneSeen = now
                           }
                       }
                   }
-
-                  // Sem leitura do anel por muito tempo: não inventar posição.
-                  if (lastSeen == 0L || now - lastSeen > 450L || staleFrames > 12) {
+          
+                  val ageAny = now - lastAnySeen
+                  val ageZone = now - lastZoneSeen
+                  // If the image stream stalls, release instead of continuing on stale coordinates.
+                  if (ageAny > 180L || ageZone > 220L) {
                       hold = false
-                      target = Float.NaN
+                      if (ageAny > 700L) reset()
                       return false
                   }
-                  if (r.isNaN() || inner.isNaN() || outer.isNaN()) {
-                      hold = false
-                      target = Float.NaN
-                      return false
-                  }
-
-                  // O alvo é uma fração da zona ATUAL. Não aplicamos velocidade da zona:
-                  // nos frames enviados, SURGE altera o tamanho da zona, não sua posição.
-                  val p = zonePos.coerceIn(0.08f, 0.92f)
-                  target = inner + p * zoneWidth
-
-                  // Previsão curta do próprio anel para compensar o atraso do toque.
-                  val lead = leadSec.coerceIn(0.04f, 0.32f)
-                  val braking = (v * kotlin.math.abs(v)) / (2f * BRAKE)
-                  val predicted = r + v * lead + braking
-
-                  val low = inner + SAFE
-                  val high = outer - SAFE
-                  if (high <= low) {
+                  if (!ring.isFinite() || !targetInner.isFinite() || !targetOuter.isFinite()) {
                       hold = false
                       return false
                   }
-
-                  // Controle por duas bordas: a proximidade da borda tem prioridade sobre o alvo central.
-                  val dangerIn = predicted <= low + 1.5f
-                  val dangerOut = predicted >= high - 1.5f
-
-                  hold = when {
-                      dangerOut -> true          // ficou grande demais -> encolher
-                      dangerIn -> false          // ficou pequeno demais -> expandir
-                      predicted > target + 1.0f -> true
-                      predicted < target - 1.0f -> false
-                      else -> hold               // histerese para não ficar alternando
+          
+                  val delay = leadSec.coerceIn(0f, 0.5f)
+                  val predictedRing = (ring + velocity * delay + 0.5f * estimatedAcceleration * delay * delay)
+                  val width = (targetOuter - targetInner).coerceIn(12f, 60f)
+                  val predictedZoneShift = (zoneVelocity * delay).coerceIn(-width * 0.65f, width * 0.65f)
+                  val predictedInner = targetInner + predictedZoneShift
+                  val predictedOuter = targetOuter + predictedZoneShift
+                  target = predictedInner + zonePos.coerceIn(0.05f, 0.95f) * (predictedOuter - predictedInner)
+          
+                  // Hysteresis scales slightly with speed but never consumes the full safe band.
+                  val margin = (abs(velocity) * delay * 0.12f + 1.2f).coerceIn(1.2f, minOf(4.0f, width * 0.18f))
+                  val innerSafety = predictedInner + maxOf(3f, width * 0.12f)
+                  val outerSafety = predictedOuter - maxOf(3f, width * 0.12f)
+          
+                  when {
+                      predictedRing <= innerSafety -> hold = false // release makes the ring grow
+                      predictedRing >= outerSafety -> hold = true // hold makes the ring shrink
+                      predictedRing > target + margin -> hold = true
+                      predictedRing < target - margin -> hold = false
+                      // Inside the dead band, preserve the command to avoid rapid gesture chatter.
                   }
+                  previousVelocity = velocity
                   return hold
               }
-
+          
               fun reset() {
                   hold = false
-                  r = Float.NaN
-                  v = 0f
-                  lastMeasuredR = Float.NaN
-                  inner = Float.NaN
-                  outer = Float.NaN
-                  zoneWidth = Float.NaN
-                  lastZoneChange = 0L
-                  lastSeen = 0L
-                  lastT = 0L
-                  staleFrames = 0
-                  target = Float.NaN
+                  ring = Float.NaN; velocity = 0f; previousMeasurement = Float.NaN
+                  targetInner = Float.NaN; targetOuter = Float.NaN; zoneMid = Float.NaN
+                  zoneVelocity = 0f; previousZoneMid = Float.NaN
+                  lastTime = 0L; lastZoneSeen = 0L; lastAnySeen = 0L
+                  estimatedAcceleration = 0f; previousVelocity = 0f; target = Float.NaN
               }
           }
           EOF_MB
           mkdir -p $(dirname app/src/main/java/com/manabot/BotAccessibilityService.kt)
           cat > app/src/main/java/com/manabot/BotAccessibilityService.kt <<'EOF_MB'
           package com.manabot
-
+          
           import android.accessibilityservice.AccessibilityService
           import android.accessibilityservice.GestureDescription
           import android.accessibilityservice.GestureDescription.StrokeDescription
@@ -485,7 +367,7 @@ jobs:
           import android.os.Looper
           import android.os.SystemClock
           import android.view.accessibility.AccessibilityEvent
-
+          
           /**
            * Segura/solta a tela com UM traço longo (sem continueStroke, que estava cancelando/recompletando
            * ~250x por segundo e travando a thread principal). Segurar = despacha um toque de 55 s.
@@ -501,7 +383,7 @@ jobs:
                   @Volatile var cancelCount = 0    // cancelados pelo sistema (não por nós)
                   @Volatile var failCount = 0      // despacho recusado
               }
-
+          
               private val main = Handler(Looper.getMainLooper())
               @Volatile private var wantHold = false
               private var holding = false
@@ -510,36 +392,29 @@ jobs:
               private var pressedAt = 0L
               private var retryPending = false
               var x = 0f; var y = 0f
-
+          
               override fun onServiceConnected() { instance = this }
               override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
               override fun onInterrupt() { setHold(false) }
               override fun onDestroy() { instance = null; super.onDestroy() }
-
-              fun setHold(h: Boolean) {
-                  if (wantHold == h) return
-                  wantHold = h
-                  main.post { sync() }
-              }
-
+          
+              fun setHold(h: Boolean) { wantHold = h; main.post { sync() } }
+          
               private fun later(ms: Long) {
                   if (retryPending) return
                   retryPending = true
                   main.postDelayed({ retryPending = false; sync() }, ms)
               }
-
+          
               private fun sync() {
                   try {
                       if (wantHold == holding) return
                       val wait = MIN_GAP_MS - (SystemClock.uptimeMillis() - lastDispatch)
                       if (wait > 0) { later(wait); return }
                       if (wantHold) press() else release()
-                  } catch (e: Exception) {
-                      failCount++
-                      later(100L)
-                  }
+                  } catch (e: Exception) { failCount++ }
               }
-
+          
               private fun press() {
                   val id = ++seq
                   val p = Path().apply { moveTo(x, y); lineTo(x + 1f, y) }
@@ -562,7 +437,7 @@ jobs:
                   lastDispatch = SystemClock.uptimeMillis()
                   if (ok) { okCount++; holding = true; pressedAt = lastDispatch } else { failCount++; later(100L) }
               }
-
+          
               private fun release() {
                   seq++            // ignora os callbacks do traço longo
                   holding = false
@@ -578,7 +453,7 @@ jobs:
           mkdir -p $(dirname app/src/main/java/com/manabot/CaptureService.kt)
           cat > app/src/main/java/com/manabot/CaptureService.kt <<'EOF_MB'
           package com.manabot
-
+          
           import android.app.*
           import android.content.Context
           import android.content.Intent
@@ -598,7 +473,7 @@ jobs:
           import android.view.MotionEvent
           import android.view.WindowManager
           import android.widget.TextView
-
+          
           class CaptureService : Service() {
               private var projection: MediaProjection? = null
               private var vd: VirtualDisplay? = null
@@ -610,13 +485,12 @@ jobs:
               private var wm: WindowManager? = null
               @Volatile private var enabled = false
               private var lastCfg = 0L
-              private var cx = 0.500f; private var cy = 0.500f
+              private var cx = 0.499f; private var cy = 0.498f
               private var tx = 0.68f; private var ty = 0.60f
               private var frames = 0; private var lastUi = 0L
-              private var frameErrors = 0
-
+          
               override fun onBind(i: Intent?): IBinder? = null
-
+          
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
                   if (projection != null) return START_NOT_STICKY   // já rodando: ignora segundo início (vazava thread/projeção)
@@ -627,7 +501,7 @@ jobs:
                   if (Build.VERSION.SDK_INT >= 29)
                       startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
                   else startForeground(1, n)
-
+          
                   val code = intent?.getIntExtra("code", 0) ?: 0
                   val data = intent?.getParcelableExtra<Intent>("data")
                   if (data == null) { stopSelf(); return START_NOT_STICKY }
@@ -638,7 +512,7 @@ jobs:
                   projection!!.registerCallback(object : MediaProjection.Callback() {
                       override fun onStop() { stopSelf() }
                   }, handler)
-
+          
                   // Sempre paisagem: lado maior = largura. Em retrato o conteúdo aparece pequeno até o Roblox girar a tela.
                   val dm = resources.displayMetrics
                   val long = maxOf(dm.widthPixels, dm.heightPixels).toFloat()
@@ -654,25 +528,22 @@ jobs:
                   showOverlay()
                   return START_NOT_STICKY
               }
-
+          
               private fun loadCfg() {
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
                   controller.zonePos = p.getFloat("gap", 50f) / 100f
                   controller.leadSec = p.getFloat("lead2", 260f) / 1000f
-                  cx = p.getFloat("cx", 50.0f) / 100f; cy = p.getFloat("cy", 50.0f) / 100f
+                  cx = p.getFloat("cx", 49.9f) / 100f; cy = p.getFloat("cy", 49.8f) / 100f
                   tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
               }
-
+          
               private fun onFrame(r: ImageReader, w: Int, h: Int) {
                   val img = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return
                   try {
                       val now = SystemClock.uptimeMillis()
                       if (now - lastCfg > 700) { loadCfg(); lastCfg = now }
                       val pl = img.planes[0]
-                      val rd = Detector.analyze(
-                          pl.buffer, pl.rowStride, pl.pixelStride, w, h, cx, cy,
-                          controller.estimatedRing, controller.estimatedZoneWidth
-                      )
+                      val rd = Detector.analyze(pl.buffer, pl.rowStride, pl.pixelStride, w, h, cx, cy, controller.currentMid(now), controller.currentRing())
                       val svc = BotAccessibilityService.instance
                       val hold: Boolean
                       if (enabled) {
@@ -686,28 +557,19 @@ jobs:
                       if (now - lastUi > 150) {
                           lastUi = now
                           val txt = (if (enabled) "ON " else "OFF") + (if (svc == null) " (sem acessib.)" else "") +
-                              if (rd != null) " R=%.0f I=%.0f O=%.0f alvo=%.0f C=%d,%d %s%s".format(
-                                  if (rd.ring.isNaN()) controller.estimatedRing else rd.ring,
-                                  rd.inner, rd.outer, controller.target,
-                                  rd.centerX.toInt(), rd.centerY.toInt(),
+                              if (rd != null) " R=%.0f%s I=%.0f O=%.0f alvo=%.0f %s%s".format(if (rd.ring.isNaN()) controller.estimatedRing else rd.ring,
+                                  if (rd.ring.isNaN()) "~" else "", rd.inner, rd.outer, controller.target,
                                   if (hold) "SEGURA" else "solta", if (rd.gold) " *" else "") else " sem leitura"
-                          val diag = " | quadros_err=%d toque ok=%d canc=%d falha=%d".format(frameErrors, BotAccessibilityService.okCount, BotAccessibilityService.cancelCount, BotAccessibilityService.failCount)
+                          val diag = " | toque ok=%d canc=%d falha=%d".format(BotAccessibilityService.okCount, BotAccessibilityService.cancelCount, BotAccessibilityService.failCount)
                           overlay?.post { overlay?.text = txt + diag }
                           dot?.post { dot?.visibility = if (hold) android.view.View.VISIBLE else android.view.View.INVISIBLE }
                       }
                   } catch (e: Exception) {
-                      // Se um quadro falhar, não reutilize um alvo/estado possivelmente obsoleto.
-                      frameErrors++
-                      try { controller.reset() } catch (_: Exception) {}
+                      // nunca deixa uma exceção de quadro derrubar o app: solta e segue no próximo quadro
                       try { BotAccessibilityService.instance?.setHold(false) } catch (_: Exception) {}
-                      val faultAt = SystemClock.uptimeMillis()
-                      if (faultAt - lastUi > 500L) {
-                          lastUi = faultAt
-                          overlay?.post { overlay?.text = "ERRO de leitura: quadros=$frameErrors | toque ok=${BotAccessibilityService.okCount} canc=${BotAccessibilityService.cancelCount} falha=${BotAccessibilityService.failCount}" }
-                      }
                   } finally { try { img.close() } catch (_: Exception) {} }
               }
-
+          
               private fun showOverlay() {
                   wm = getSystemService(WINDOW_SERVICE) as WindowManager
                   val tv = TextView(this).apply {
@@ -749,7 +611,7 @@ jobs:
                       x = (p.getFloat("tx", 68f) / 100f * lw).toInt() - 24; y = (p.getFloat("ty", 60f) / 100f * lh).toInt() - 24 }
                   try { wm!!.addView(d, dl); dot = d } catch (e: Exception) {}
               }
-
+          
               override fun onDestroy() {
                   try { BotAccessibilityService.instance?.setHold(false) } catch (_: Exception) {}
                   try { reader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
@@ -766,20 +628,21 @@ jobs:
           mkdir -p $(dirname app/src/main/java/com/manabot/MainActivity.kt)
           cat > app/src/main/java/com/manabot/MainActivity.kt <<'EOF_MB'
           package com.manabot
-
+          
           import android.app.Activity
           import android.content.Context
           import android.content.Intent
           import android.media.projection.MediaProjectionManager
           import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.widget.*
-
+          
           class MainActivity : Activity() {
               private val REQ = 42
               private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
-
+          
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 40, 40, 40) }
@@ -794,16 +657,12 @@ jobs:
                       startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                   })
                   root.addView(btn("3. Iniciar captura + caixinha") {
-                      if (!Settings.canDrawOverlays(this)) {
-                          Toast.makeText(this, "Permita a sobreposição e toque novamente para iniciar.", Toast.LENGTH_LONG).show()
-                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-                      } else {
-                          val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                          startActivityForResult(mpm.createScreenCaptureIntent(), REQ)
-                      }
+                      if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                      val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      startActivityForResult(mpm.createScreenCaptureIntent(), REQ)
                   })
-                  root.addView(btn("Parar") { stopService(Intent(this, CaptureService::class.java)) })
-
+                  root.addView(btn("Parar") { startService(Intent(this, CaptureService::class.java).setAction("STOP")) })
+          
                   fun slider(name: String, key: String, min: Float, max: Float, def: Float, unit: String) {
                       val v = prefs.getFloat(key, def)
                       val tv = label("$name: ${"%.1f".format(v)}$unit")
@@ -821,14 +680,14 @@ jobs:
                       root.addView(tv); root.addView(sb)
                   }
                   slider("Posição na zona (0=interno, 100=externo)", "gap", 0f, 100f, 50f, " %")
-                  slider("Antecipação (atraso do jogo)", "lead2", 0f, 500f, 260f, " ms")
-                  slider("Centro do círculo X", "cx", 35f, 65f, 50.0f, " %")
-                  slider("Centro do círculo Y", "cy", 30f, 70f, 50.0f, " %")
+                  slider("Antecipação (atraso captura/toque)", "lead2", 40f, 350f, 180f, " ms")
+                  slider("Centro do círculo X", "cx", 40f, 60f, 49.9f, " %")
+                  slider("Centro do círculo Y", "cy", 40f, 60f, 49.8f, " %")
                   slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
                   slider("Ponto de toque Y", "ty", 45f, 80f, 60f, " %")
                   setContentView(ScrollView(this).apply { addView(root) })
               }
-
+          
               @Deprecated("Deprecated in Java")
               override fun onActivityResult(rq: Int, rc: Int, data: Intent?) {
                   super.onActivityResult(rq, rc, data)
@@ -839,30 +698,78 @@ jobs:
               }
           }
           EOF_MB
+          mkdir -p app/src/test/java/com/manabot
+          cat > app/src/test/java/com/manabot/CoreRegressionTest.kt <<'EOF_MB'
+          package com.manabot
+          
+          import java.nio.ByteBuffer
+          import kotlin.math.sqrt
+          import org.junit.Assert.*
+          import org.junit.Test
+          
+          class CoreRegressionTest {
+              private fun syntheticFrame(w: Int = 400, h: Int = 300): ByteBuffer {
+                  val buffer = ByteBuffer.allocate(w * h * 4)
+                  for (y in 0 until h) for (x in 0 until w) {
+                      val i = (y * w + x) * 4
+                      buffer.put(i, 20.toByte()); buffer.put(i + 1, 20.toByte())
+                      buffer.put(i + 2, 20.toByte()); buffer.put(i + 3, 255.toByte())
+                  }
+                  val cx = 0.536f * w; val cy = 0.517f * h
+                  for (y in 0 until h) for (x in 0 until w) {
+                      val radius = sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy))
+                      val edge = radius in 67.5..70.0 || radius in 91.0..93.0
+                      val ring = radius in 77.0..83.0
+                      if (edge || ring) {
+                          val i = (y * w + x) * 4
+                          buffer.put(i, if (ring) 250.toByte() else 245.toByte())
+                          buffer.put(i + 1, if (ring) 210.toByte() else 245.toByte())
+                          buffer.put(i + 2, if (ring) 60.toByte() else 245.toByte())
+                      }
+                  }
+                  return buffer
+              }
+          
+              @Test fun detectsSyntheticConcentricRings() {
+                  val w = 400; val h = 300
+                  val result = Detector.analyze(syntheticFrame(w, h), w * 4, 4, w, h, .536f, .517f)
+                  assertNotNull(result)
+                  assertTrue(result!!.ring in 75f..85f)
+                  assertTrue(result.inner in 63f..74f)
+                  assertTrue(result.outer in 87f..98f)
+              }
+          
+              @Test fun rejectsBlankFrame() {
+                  val w = 400; val h = 300
+                  assertNull(Detector.analyze(ByteBuffer.allocate(w * h * 4), w * 4, 4, w, h, .536f, .517f))
+              }
+          
+              @Test fun controllerKeepsRingNearBandAndReleasesWhenStale() {
+                  val controller = Controller().apply { leadSec = .1f; zonePos = .5f }
+                  var now = 1_000L
+                  var radius = 82f
+                  var hold = false
+                  repeat(90) {
+                      hold = controller.update(Detector.Reading(radius, 69f, 92f, false, 1f), now)
+                      radius += if (hold) -0.7f else 0.7f
+                      radius = radius.coerceIn(45f, 120f)
+                      now += 33L
+                  }
+                  assertTrue("radius drifted outside the safe test band: $radius", radius in 62f..99f)
+                  assertFalse(controller.update(null, now + 1_000L))
+              }
+          }
+          EOF_MB
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
-      - name: Configurar Android SDK
-        uses: android-actions/setup-android@v4
-      - name: Instalar SDK exigido pelo projeto
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+      - name: Aceitar licencas do SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.9"
-      - name: Compilar APK de depuração
-        run: gradle assembleDebug --no-daemon --stacktrace
-      - name: Enviar APK
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ManaBot-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-      - name: Guardar relatórios de compilação em caso de falha
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ManaBot-build-reports
-          path: |
-            app/build/reports/**
-            app/build/outputs/logs/**
-          if-no-files-found: warn
+        with: { gradle-version: 8.9 }
+      - name: Testes de regressão do detector e controlador
+        run: gradle testDebugUnitTest --no-daemon
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with: { name: ManaBot-apk, path: app/build/outputs/apk/debug/app-debug.apk }
+
