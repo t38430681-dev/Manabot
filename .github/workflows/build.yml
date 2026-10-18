@@ -120,7 +120,10 @@ jobs:
            * (em frame de 1068 px de largura).
            */
           object Detector {
-              /** ring = anel grosso (mana, controlado); inner/outer = círculos finos da zona (ou NaN) */
+              /**
+               * ring  = anel grosso (a mana que você controla); NaN se não achou
+               * inner/outer = os dois círculos finos da zona (separados ~30-46 px); NaN se não achou
+               */
               class Reading(val ring: Float, val inner: Float, val outer: Float, val gold: Boolean)
               private class Run(val c: Float, val w: Int, val gold: Boolean)
 
@@ -149,8 +152,7 @@ jobs:
                           }
                           rr /= 3; gg /= 3; bb /= 3
                           val isGold = rr > 200 && gg > 140 && bb < 120
-                          // laranja/vermelho/rosa vivo: cores do anel durante SURGE ou fora da zona
-                          val warm = rr > 215 && rr - gg > 55 && bb < 235
+                          val warm = rr > 215 && rr - gg > 55 && bb < 235   // anel laranja/vermelho/rosa
                           gd[i] = isGold
                           bright[i] = isGold || warm || minOf(rr, gg, bb) > 190
                       }
@@ -166,28 +168,37 @@ jobs:
                               i = j + 1
                           } else i++
                       }
-                      // anel: run grosso mais externo (+ a borda interna, se for o par de bordas)
+                      // anel grosso mais externo (+ borda interna do par)
                       val thick = runs.filter { it.w >= 3 && it.c in 14f..128f }
-                      if (thick.isEmpty()) continue
-                      val outerThick = thick.maxByOrNull { it.c }!!
-                      val inner = thick.filter { it !== outerThick && outerThick.c - it.c <= 10f }.maxByOrNull { it.c }
-                      val ringC = if (inner != null) (outerThick.c + inner.c) / 2f else outerThick.c
-                      val g = thick.any { it.gold }
-                      // círculos finos da zona: o mais próximo abaixo e o mais próximo acima do anel
-                      val thin = runs.filter { it.w <= 2 && it.c in 14f..133f && Math.abs(it.c - ringC) > 6f }
-                      val lo = thin.filter { it.c < ringC }.maxByOrNull { it.c }?.c
-                      val hi = thin.filter { it.c > ringC }.minByOrNull { it.c }?.c
-                      rg.add(ringC); gold = gold || g
-                      if (lo != null && ringC - lo <= 60f) ins.add(lo)
-                      if (hi != null && hi - ringC <= 60f) outs.add(hi)
+                      var ringC = Float.NaN
+                      if (thick.isNotEmpty()) {
+                          val ot = thick.maxByOrNull { it.c }!!
+                          val inn = thick.filter { it !== ot && ot.c - it.c <= 10f }.maxByOrNull { it.c }
+                          ringC = if (inn != null) (ot.c + inn.c) / 2f else ot.c
+                          rg.add(ringC)
+                          if (thick.any { it.gold }) gold = true
+                      }
+                      // zona = par de círculos finos separados ~30..46 px
+                      val thin = runs.filter { it.w <= 2 && it.c in 14f..133f }.map { it.c }.sorted()
+                      var best: Pair<Float, Float>? = null; var bestScore = Float.MAX_VALUE
+                      for (a in thin.indices) for (b in a + 1 until thin.size) {
+                          val sep = thin[b] - thin[a]
+                          if (sep < 28f || sep > 46f) continue
+                          val mid = (thin[a] + thin[b]) / 2f
+                          val score = if (!ringC.isNaN()) Math.abs(mid - ringC) else -mid   // sem anel: o par mais externo
+                          if (score < bestScore) { bestScore = score; best = Pair(thin[a], thin[b]) }
+                      }
+                      if (best != null) { ins.add(best.first); outs.add(best.second) }
+                      else if (!ringC.isNaN()) {
+                          val lo = thin.filter { it < ringC - 6f }.maxOrNull()
+                          val hi = thin.filter { it > ringC + 6f }.minOrNull()
+                          if (lo != null && ringC - lo <= 60f) ins.add(lo)
+                          if (hi != null && hi - ringC <= 60f) outs.add(hi)
+                      }
                   }
-                  if (rg.isEmpty()) return null
-                  return Reading(
-                      rg.average().toFloat(),
-                      if (ins.isEmpty()) Float.NaN else ins.average().toFloat(),
-                      if (outs.isEmpty()) Float.NaN else outs.average().toFloat(),
-                      gold
-                  )
+                  if (rg.isEmpty() && ins.isEmpty() && outs.isEmpty()) return null
+                  fun avg(l: List<Float>) = if (l.isEmpty()) Float.NaN else l.average().toFloat()
+                  return Reading(avg(rg), avg(ins), avg(outs), gold)
               }
           }
           EOF_MB
@@ -196,73 +207,75 @@ jobs:
           package com.manabot
 
           /**
-           * Medido nos seus vídeos: o anel (R) anda a -20 px/s segurando e +20 px/s soltando (atraso ~0,15 s).
-           * A zona (círculos finos I < O) se move sozinha (até ~10-30 px/s). Objetivo: manter R dentro da zona.
-           * Se só uma das linhas da zona aparece, a outra é inferida pela largura lembrada (W).
-           * Controle: liga/desliga com antecipação do atraso e da velocidade do alvo.
+           * O anel grosso (R) é a mana: SEGURAR encolhe, SOLTAR expande. A zona estável é a faixa entre dois
+           * círculos finos (~40 px). Dinâmica medida nos vídeos: a = +43 (solto) / -40 (segurando) - 2.5*v  (px/s^2).
+           * O SURGE move a zona inteira (20-30 px/s para fora ou para dentro): o controle acompanha a velocidade
+           * da zona e mira um pouco à frente dela. Se o anel some (laranja/vermelho/pequeno), o estado é estimado
+           * pelo modelo, em vez de soltar às cegas.
            */
           class Controller {
-              var zonePos = 0.5f          // 0 = círculo interno, 1 = externo
-              var leadSec = 0.15f         // atraso do jogo/toque
+              var zonePos = 0.5f
+              var leadSec = 0.22f
               private var hold = false
-              private var lastR = Float.NaN
+              // estado estimado do anel
+              private var r = Float.NaN
+              private var v = 0f
+              private var lastMeas = Float.NaN
+              // zona
+              private var mid = Float.NaN
+              private var width = 40f
+              private var vZone = 0f
+              private var lastMid = Float.NaN
               private var lastT = 0L
-              private var dR = 0f
-              private var lastSeen = 0L
-
-              private var w = 40f                 // largura lembrada da zona
-              private var m = Float.NaN           // centro suavizado da zona
-              private var dM = 0f
-              private var lastM = Float.NaN
-              private var lastMT = 0L
-              private var mAge = 0L
-
+              private var lastZoneSeen = 0L
+              private var lastAnySeen = 0L
               var target = Float.NaN; private set
-              private var lastTarget = Float.NaN
-              var zoneInferred = false; private set
+              val estimatedRing get() = r
 
               fun update(rd: Detector.Reading?, now: Long): Boolean {
-                  if (rd == null) {
-                      // sem leitura (ex.: anel apagou no SURGE): decide pelo último estado conhecido
-                      if (now - lastSeen > 150 && !lastR.isNaN() && !lastTarget.isNaN()) hold = lastR + leadSec * dR > lastTarget
-                      else if (now - lastSeen > 150) hold = false
-                      return hold
+                  val dt = if (lastT == 0L) 0.033f else ((now - lastT) / 1000f).coerceIn(0.005f, 0.2f)
+                  lastT = now
+                  // 1) propaga o modelo do anel com o último comando
+                  if (!r.isNaN()) {
+                      val a = (if (hold) -40f else 43f) - 2.5f * v
+                      v += a * dt; r = (r + v * dt).coerceIn(0f, 170f)
                   }
-                  lastSeen = now
-                  val hasI = !rd.inner.isNaN(); val hasO = !rd.outer.isNaN()
-                  var mNow = Float.NaN
-                  zoneInferred = false
-                  if (hasI && hasO) {
-                      val ww = rd.outer - rd.inner
-                      if (ww in 8f..90f) w = 0.8f * w + 0.2f * ww
-                      mNow = (rd.inner + rd.outer) / 2f; mAge = now
-                  } else if (hasO) { mNow = rd.outer - w / 2f; zoneInferred = true; mAge = now }
-                  else if (hasI) { mNow = rd.inner + w / 2f; zoneInferred = true; mAge = now }
-                  else if (rd.gold) { mNow = rd.ring; zoneInferred = true }          // dourado: anel está dentro da zona
-                  else if (!m.isNaN() && now - mAge < 700) { mNow = m + dM * (now - lastMT) / 1000f; zoneInferred = true }
-
-                  if (!mNow.isNaN()) {
-                      if (!m.isNaN() && now > lastMT) {
-                          val d = (mNow - m) / ((now - lastMT) / 1000f)
-                          dM = 0.7f * dM + 0.3f * d.coerceIn(-60f, 60f)
+                  if (rd != null) {
+                      val hasR = !rd.ring.isNaN()
+                      val hasI = !rd.inner.isNaN(); val hasO = !rd.outer.isNaN()
+                      if (hasR || hasI || hasO) lastAnySeen = now
+                      if (hasR) {
+                          if (!lastMeas.isNaN()) {
+                              val dm = ((rd.ring - lastMeas) / dt).coerceIn(-120f, 120f)
+                              v = 0.5f * v + 0.5f * dm
+                          }
+                          lastMeas = rd.ring; r = rd.ring
+                      } else lastMeas = Float.NaN
+                      // 2) zona
+                      var m = Float.NaN
+                      if (hasI && hasO) { m = rd.inner + zonePos * (rd.outer - rd.inner); width = rd.outer - rd.inner }
+                      else if (hasO) m = rd.outer - 12f
+                      else if (hasI) m = rd.inner + 12f
+                      if (!m.isNaN()) {
+                          if (!lastMid.isNaN() && now - lastZoneSeen < 300) {
+                              val dz = ((m - lastMid) / dt).coerceIn(-80f, 80f)
+                              vZone = 0.6f * vZone + 0.4f * dz
+                          } else vZone = 0f
+                          lastMid = m; mid = m; lastZoneSeen = now
                       }
-                      m = if (m.isNaN()) mNow else 0.5f * m + 0.5f * mNow
-                      lastMT = now
                   }
-                  if (!lastR.isNaN() && now > lastT) {
-                      val d = (rd.ring - lastR) / ((now - lastT) / 1000f)
-                      dR = 0.6f * dR + 0.4f * d.coerceIn(-120f, 120f)
-                  }
-                  lastR = rd.ring; lastT = now
-                  if (!target.isNaN()) lastTarget = target
-                  if (m.isNaN()) { target = Float.NaN; return hold }
-                  target = m + (zonePos - 0.5f) * w
-                  val e = (rd.ring + leadSec * dR) - (target + leadSec * dM)
-                  if (e > 2f) hold = true else if (e < -2f) hold = false
+                  // 3) nada visível por um tempo (tela de resultado, menu): solta e zera
+                  if (now - lastAnySeen > 700) { hold = false; r = Float.NaN; v = 0f; vZone = 0f; target = Float.NaN; return hold }
+                  if (mid.isNaN() || r.isNaN()) return hold
+                  // 4) alvo: meio da zona, um pouco à frente do movimento dela
+                  val ahead = (0.7f * vZone).coerceIn(-0.35f * width, 0.35f * width)
+                  target = mid + (if (now - lastZoneSeen < 400) ahead else 0f)
+                  val e = r + leadSec * v - target
+                  if (e > 1.5f) hold = true else if (e < -1.5f) hold = false
                   return hold
               }
 
-              fun reset() { hold = false; lastR = Float.NaN; dR = 0f; m = Float.NaN; dM = 0f }
+              fun reset() { hold = false; r = Float.NaN; v = 0f; vZone = 0f; mid = Float.NaN; lastMid = Float.NaN; lastMeas = Float.NaN; lastT = 0L; lastAnySeen = 0L }
           }
           EOF_MB
           mkdir -p $(dirname app/src/main/java/com/manabot/BotAccessibilityService.kt)
@@ -438,7 +451,8 @@ jobs:
                       if (now - lastUi > 150) {
                           lastUi = now
                           val txt = (if (enabled) "ON " else "OFF") + (if (svc == null) " (sem acessib.)" else "") +
-                              if (rd != null) " R=%.0f I=%.0f O=%.0f alvo=%.0f %s%s".format(rd.ring, rd.inner, rd.outer, controller.target,
+                              if (rd != null) " R=%.0f%s I=%.0f O=%.0f alvo=%.0f %s%s".format(if (rd.ring.isNaN()) controller.estimatedRing else rd.ring,
+                                  if (rd.ring.isNaN()) "~" else "", rd.inner, rd.outer, controller.target,
                                   if (hold) "SEGURA" else "solta", if (rd.gold) " *" else "") else " sem leitura"
                           val diag = " | toque ok=%d canc=%d falha=%d".format(BotAccessibilityService.okCount, BotAccessibilityService.cancelCount, BotAccessibilityService.failCount)
                           overlay?.post { overlay?.text = txt + diag }
