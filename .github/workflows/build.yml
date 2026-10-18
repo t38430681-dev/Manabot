@@ -220,8 +220,12 @@ jobs:
            * pelo modelo, em vez de soltar às cegas.
            */
           class Controller {
+              companion object {
+                  const val BRAKE = 100f     // px/s^2 de frenagem efetiva (inclui atraso de resposta)
+                  const val SAFE_OUT = 2f    // mira levemente para fora do meio da zona
+              }
               var zonePos = 0.5f
-              var leadSec = 0.28f
+              var leadSec = 0.26f
               private var hold = false
               // estado estimado do anel
               private var r = Float.NaN
@@ -264,10 +268,10 @@ jobs:
                       else if (hasO) m = rd.outer - width / 2f
                       else if (hasI) m = rd.inner + width / 2f
                       if (!m.isNaN()) {
-                          if (!lastMid.isNaN() && now - lastZoneSeen < 300) {
-                              val dz = ((m - lastMid) / dt).coerceIn(-80f, 80f)
-                              vZone = 0.6f * vZone + 0.4f * dz
-                          } else vZone = 0f
+                          if (!lastMid.isNaN() && now - lastZoneSeen < 300 && Math.abs(m - lastMid) < 12f) {
+                              val dz = ((m - lastMid) / dt).coerceIn(-45f, 45f)
+                              vZone = 0.7f * vZone + 0.3f * dz
+                          } else vZone = 0f   // salto = par de círculos trocado/reencontrado: não vira "velocidade" da zona
                           lastMid = m; mid = m; lastZoneSeen = now
                       }
                   }
@@ -275,10 +279,20 @@ jobs:
                   if (now - lastAnySeen > 700) { hold = false; r = Float.NaN; v = 0f; vZone = 0f; target = Float.NaN; return hold }
                   if (mid.isNaN() || r.isNaN()) return hold
                   // 4) alvo: meio da zona, um pouco à frente do movimento dela
-                  val ahead = (0.7f * vZone).coerceIn(-0.35f * width, 0.35f * width)
+                  val ahead = (0.4f * vZone).coerceIn(-0.2f * width, 0.2f * width)
                   target = mid + (if (now - lastZoneSeen < 400) ahead else 0f)
-                  val e = r + leadSec * v - target
-                  if (e > 1.5f) hold = true else if (e < -1.5f) hold = false
+                  // Posição prevista: atraso (captura + toque + jogo) E distância de frenagem. Segurando, o anel
+                  // chega a ~-50 px/s e continua caindo mesmo depois de soltar (medido: soltou em R~49 e foi a 20).
+                  // Por isso o termo v*|v|/(2*BRAKE) — sem ele o anel entra no círculo interno e quebra (FAILED).
+                  val brake = v * Math.abs(v) / (2f * BRAKE)
+                  val pred = r + leadSec * v + brake
+                  // Margem de segurança: errar para dentro é fatal, errar para fora é só recuperável.
+                  val e = pred - (target + SAFE_OUT)
+                  // Piso: se o anel previsto cai abaixo do círculo interno da zona, solta SEMPRE.
+                  val floorEdge = mid - width / 2f
+                  if (v < 0f && pred < floorEdge + 4f) hold = false
+                  else if (e > 1.5f) hold = true
+                  else if (e < -1.5f) hold = false
                   return hold
               }
 
@@ -433,7 +447,7 @@ jobs:
               private fun loadCfg() {
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
                   controller.zonePos = p.getFloat("gap", 50f) / 100f
-                  controller.leadSec = p.getFloat("lead", 150f) / 1000f
+                  controller.leadSec = p.getFloat("lead2", 260f) / 1000f
                   cx = p.getFloat("cx", 49.9f) / 100f; cy = p.getFloat("cy", 49.8f) / 100f
                   tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
               }
@@ -575,7 +589,7 @@ jobs:
                       root.addView(tv); root.addView(sb)
                   }
                   slider("Posição na zona (0=interno, 100=externo)", "gap", 0f, 100f, 50f, " %")
-                  slider("Antecipação (atraso do jogo)", "lead", 0f, 300f, 150f, " ms")
+                  slider("Antecipação (atraso do jogo)", "lead2", 0f, 500f, 260f, " ms")
                   slider("Centro do círculo X", "cx", 44f, 56f, 49.9f, " %")
                   slider("Centro do círculo Y", "cy", 44f, 56f, 49.8f, " %")
                   slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
