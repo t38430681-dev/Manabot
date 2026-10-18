@@ -113,6 +113,7 @@ jobs:
           package com.manabot
 
           import java.nio.ByteBuffer
+          import kotlin.math.roundToInt
 
           /**
            * Lê três linhas horizontais perto do centro e estima os raios:
@@ -122,96 +123,202 @@ jobs:
            * Os raios são estimativas em pixels do quadro redimensionado para 1068 px de largura.
            */
           object Detector {
-              /**
-               * ring  = anel grosso (a mana que você controla); NaN se não achou
-               * inner/outer = os dois círculos finos da zona (separados ~30-46 px); NaN se não achou
-               */
-              class Reading(val ring: Float, val inner: Float, val outer: Float, val gold: Boolean)
-              private class Run(val c: Float, val w: Int, val gold: Boolean)
-
               const val FRAME_W = 1068
+              const val MIN_R = 8
+              const val MAX_R = 150
+
+              class Reading(
+                  val ring: Float,
+                  val inner: Float,
+                  val outer: Float,
+                  val gold: Boolean,
+                  val centerX: Float,
+                  val centerY: Float
+              )
+
+              private data class Run(val c: Float, val w: Int, val score: Float, val gold: Boolean)
+              private var cachedX = -1
+              private var cachedY = -1
+              private var lastLocateNs = 0L
+
+              // Um Int compactado evita dezenas de milhares de pequenas alocações por frame.
+              private fun pixel(buf: ByteBuffer, rowStride: Int, pixStride: Int, x: Int, y: Int): Int {
+                  val o = y * rowStride + x * pixStride
+                  val r = buf.get(o).toInt() and 255
+                  val g = buf.get(o + 1).toInt() and 255
+                  val b = buf.get(o + 2).toInt() and 255
+                  return (r shl 16) or (g shl 8) or b
+              }
+              private fun pr(p: Int) = (p ushr 16) and 255
+              private fun pg(p: Int) = (p ushr 8) and 255
+              private fun pb(p: Int) = p and 255
+
+              private fun isRingPixel(r: Int, g: Int, b: Int): Boolean {
+                  val white = minOf(r, g, b) >= 185 && maxOf(r, g, b) - minOf(r, g, b) <= 90
+                  val pinkWhite = r >= 205 && g >= 145 && b >= 175
+                  val gold = r >= 185 && g >= 105 && r - g >= 35 && b <= 165
+                  return white || pinkWhite || gold
+              }
+
+              private fun isGoldPixel(r: Int, g: Int, b: Int): Boolean =
+                  r >= 185 && g >= 105 && r - g >= 35 && b <= 165
+
+              /**
+               * Procura o centro real do conjunto de círculos. A versão anterior usava um X/Y fixo
+               * (67,5% / 51%), que não corresponde ao centro visível nos frames enviados. Aqui o
+               * centro informado pelo usuário é apenas o ponto inicial; a simetria circular pode corrigi-lo.
+               */
+              private fun locateCenter(
+                  buf: ByteBuffer, rowStride: Int, pixStride: Int, w: Int, h: Int,
+                  seedX: Int, seedY: Int
+              ): Triple<Int, Int, Float> {
+                  var bestX = seedX
+                  var bestY = seedY
+                  var best = -1f
+                  val radii = intArrayOf(28, 40, 55, 72, 92, 115)
+                  val angles = 12
+                  val maxDx = minOf(96, w / 8)
+                  val maxDy = minOf(72, h / 8)
+                  for (dy in -maxDy..maxDy step 8) {
+                      val cy = (seedY + dy).coerceIn(MAX_R + 2, h - MAX_R - 3)
+                      for (dx in -maxDx..maxDx step 8) {
+                          val cx = (seedX + dx).coerceIn(MAX_R + 2, w - MAX_R - 3)
+                          var score = 0f
+                          var pairs = 0
+                          for (ri in radii.indices) {
+                              val rr = radii[ri]
+                              for (a in 0 until angles / 2) {
+                                  val t = (a * 2.0 * Math.PI / angles)
+                                  val cs = kotlin.math.cos(t).toFloat()
+                                  val sn = kotlin.math.sin(t).toFloat()
+                                  val x1 = (cx + rr * cs).toInt().coerceIn(0, w - 1)
+                                  val y1 = (cy + rr * sn).toInt().coerceIn(0, h - 1)
+                                  val x2 = (cx - rr * cs).toInt().coerceIn(0, w - 1)
+                                  val y2 = (cy - rr * sn).toInt().coerceIn(0, h - 1)
+                                  val p1 = pixel(buf, rowStride, pixStride, x1, y1)
+                                  val p2 = pixel(buf, rowStride, pixStride, x2, y2)
+                                  val b1 = isRingPixel(pr(p1), pg(p1), pb(p1))
+                                  val b2 = isRingPixel(pr(p2), pg(p2), pb(p2))
+                                  if (b1 && b2) score += 2f
+                                  else if (b1 || b2) score += 0.25f
+                                  pairs++
+                              }
+                          }
+                          score /= pairs.coerceAtLeast(1)
+                          // Penaliza deslocamentos muito grandes para evitar escolher outra estrutura simétrica.
+                          score -= 0.0008f * (dx * dx + dy * dy)
+                          if (score > best) { best = score; bestX = cx; bestY = cy }
+                      }
+                  }
+                  val confidence = (best / 2f).coerceIn(0f, 1f)
+                  return Triple(bestX, bestY, confidence)
+              }
 
               fun analyze(
                   buf: ByteBuffer, rowStride: Int, pixStride: Int, w: Int, h: Int,
-                  cxFrac: Float, cyFrac: Float, prevMid: Float = Float.NaN
+                  cxFrac: Float, cyFrac: Float, prevRing: Float = Float.NaN, prevWidth: Float = Float.NaN
               ): Reading? {
-                  val cx = (cxFrac * w).toInt()
-                  val cy = (cyFrac * h).toInt().coerceIn(1, h - 2)
-                  val rmax = 140
-                  if (cx - rmax < 0 || cx + rmax >= w) return null
-                  val rg = ArrayList<Float>(2); val ins = ArrayList<Float>(2); val outs = ArrayList<Float>(2); var gold = false
-                  for (sgn in intArrayOf(-1, 1)) {
-                      val n = rmax - 8
-                      val bright = BooleanArray(n); val gd = BooleanArray(n)
-                      for (i in 0 until n) {
-                          val x = cx + sgn * (i + 8)
-                          var rr = 0; var gg = 0; var bb = 0
-                          for (dy in -1..1) {
-                              val o = (cy + dy) * rowStride + x * pixStride
-                              rr += buf.get(o).toInt() and 255
-                              gg += buf.get(o + 1).toInt() and 255
-                              bb += buf.get(o + 2).toInt() and 255
-                          }
-                          rr /= 3; gg /= 3; bb /= 3
-                          val isGold = rr > 200 && gg > 140 && bb < 120
-                          val warm = rr > 215 && rr - gg > 55 && bb < 235   // anel laranja/vermelho/rosa
-                          gd[i] = isGold
-                          bright[i] = isGold || warm || minOf(rr, gg, bb) > 190
-                      }
-                      val runs = ArrayList<Run>()
-                      var i = 0
-                      while (i < n) {
-                          if (bright[i]) {
-                              var j = i
-                              while (j + 1 < n && bright[j + 1]) j++
-                              var g = false
-                              for (k in i..j) if (gd[k]) g = true
-                              runs.add(Run((i + j) / 2f + 8f, j - i + 1, g))
-                              i = j + 1
-                          } else i++
-                      }
-                      // anel grosso mais externo (+ borda interna do par)
-                      val thick = runs.filter { it.w >= 3 && it.c in 14f..128f }
-                      var ringC = Float.NaN
-                      if (thick.isNotEmpty()) {
-                          val ot = thick.maxByOrNull { it.c }!!
-                          val inn = thick.filter { it !== ot && ot.c - it.c <= 10f }.maxByOrNull { it.c }
-                          ringC = if (inn != null) (ot.c + inn.c) / 2f else ot.c
-                          rg.add(ringC)
-                          if (thick.any { it.gold }) gold = true
-                      }
-                      // zona = par de círculos finos separados ~28..46 px. Escolhe o par mais próximo da zona anterior
-                      // (a zona se move de forma contínua); sem histórico, o mais próximo do anel.
-                      val thin = runs.filter { it.w <= 2 && it.c in 14f..133f }.map { it.c }.sorted()
-                      var best: Pair<Float, Float>? = null; var bestScore = Float.MAX_VALUE
-                      for (a in thin.indices) for (b in a + 1 until thin.size) {
-                          val sep = thin[b] - thin[a]
-                          if (sep < 28f || sep > 46f) continue
-                          val mid = (thin[a] + thin[b]) / 2f
-                          // Evita saltar para um par distante quando a detecção falha; permite salto maior
-                          // apenas quando não há histórico válido (início/reinício da captura).
-                          val distance = when {
-                              !prevMid.isNaN() -> Math.abs(mid - prevMid)
-                              !ringC.isNaN() -> Math.abs(mid - ringC)
-                              else -> 0f
-                          }
-                          if (!prevMid.isNaN() && distance > 58f) continue
-                          val widthPenalty = Math.abs(sep - 38f) * 0.12f
-                          val score = distance + widthPenalty
-                          if (score < bestScore) { bestScore = score; best = Pair(thin[a], thin[b]) }
-                      }
-                      if (best != null) { ins.add(best.first); outs.add(best.second) }
-                      else if (!ringC.isNaN()) {
-                          // sem par: um círculo só. Ignora o círculo fixo do pentagrama (~31 px).
-                          val lo = thin.filter { it < ringC - 6f && it > 40f }.maxOrNull()
-                          val hi = thin.filter { it > ringC + 6f }.minOrNull()
-                          if (lo != null && ringC - lo <= 45f) ins.add(lo)
-                          if (hi != null && hi - ringC <= 45f) outs.add(hi)
-                      }
+                  val seedX = (cxFrac * w).toInt().coerceIn(MAX_R + 2, w - MAX_R - 3)
+                  val seedY = (cyFrac * h).toInt().coerceIn(MAX_R + 2, h - MAX_R - 3)
+                  val nowNs = System.nanoTime()
+                  val needLocate = cachedX < 0 || nowNs - lastLocateNs > 250_000_000L ||
+                      kotlin.math.abs(cachedX - seedX) > 42 || kotlin.math.abs(cachedY - seedY) > 42
+                  if (needLocate) {
+                      val located = locateCenter(buf, rowStride, pixStride, w, h, seedX, seedY)
+                      cachedX = located.first
+                      cachedY = located.second
+                      lastLocateNs = nowNs
                   }
-                  if (rg.isEmpty() && ins.isEmpty() && outs.isEmpty()) return null
-                  fun avg(l: List<Float>) = if (l.isEmpty()) Float.NaN else l.average().toFloat()
-                  return Reading(avg(rg), avg(ins), avg(outs), gold)
+                  val cx = cachedX
+                  val cy = cachedY
+
+                  // Perfil radial: várias direções, não apenas três linhas horizontais.
+                  val angles = 24
+                  val hits = IntArray(MAX_R + 1)
+                  val goldHits = IntArray(MAX_R + 1)
+                  for (r in MIN_R..MAX_R) {
+                      var count = 0
+                      var gold = 0
+                      for (a in 0 until angles) {
+                          val t = 2.0 * Math.PI * a / angles
+                          val x = (cx + r * kotlin.math.cos(t)).toInt().coerceIn(0, w - 1)
+                          val y = (cy + r * kotlin.math.sin(t)).toInt().coerceIn(0, h - 1)
+                          val p = pixel(buf, rowStride, pixStride, x, y)
+                          val rr = pr(p); val gg = pg(p); val bb = pb(p)
+                          if (isRingPixel(rr, gg, bb)) count++
+                          if (isGoldPixel(rr, gg, bb)) gold++
+                      }
+                      hits[r] = count
+                      goldHits[r] = gold
+                  }
+
+                  // Suaviza o perfil para tolerar pequenas quebras causadas por brilho/textura.
+                  val smooth = IntArray(MAX_R + 1)
+                  for (r in MIN_R..MAX_R) {
+                      smooth[r] = ((hits.getOrElse(r - 1) { 0 } + hits[r] + hits.getOrElse(r + 1) { 0 }) / 3f).roundToInt()
+                  }
+
+                  val runs = ArrayList<Run>()
+                  var r = MIN_R
+                  while (r <= MAX_R) {
+                      if (smooth[r] >= 5) {
+                          val begin = r
+                          var total = 0f
+                          var n = 0
+                          while (r <= MAX_R && smooth[r] >= 5) {
+                              total += smooth[r]
+                              n++
+                              r++
+                          }
+                          val end = r - 1
+                          val center = (begin + end) / 2f
+                          val width = end - begin + 1
+                          val score = total / n.coerceAtLeast(1)
+                          val gold = (begin..end).any { goldHits[it] >= 5 }
+                          runs.add(Run(center, width, score, gold))
+                      } else r++
+                  }
+
+                  if (runs.isEmpty()) return null
+
+                  // Primeiro identificamos o anel controlado usando o histórico. Isso é importante
+                  // porque o círculo externo dourado do SURGE também é perfeitamente circular.
+                  val roughRingCandidates = runs.filter { it.w >= 2 && it.c in 45f..130f }
+                  val ringRun = if (!prevRing.isNaN() && roughRingCandidates.isNotEmpty()) {
+                      roughRingCandidates.minByOrNull { kotlin.math.abs(it.c - prevRing) - it.score * 0.04f }
+                  } else {
+                      roughRingCandidates.maxByOrNull { it.score - kotlin.math.abs(it.c - 115f) * 0.015f }
+                  }
+                  val ring = ringRun?.c ?: Float.NaN
+
+                  // A faixa-alvo é procurada em torno do anel. Em SURGE, uma das bordas pode
+                  // desaparecer visualmente; por isso uma borda forte + largura conhecida é válida.
+                  val widthGuess = if (!prevWidth.isNaN() && prevWidth in 28f..58f) prevWidth else 42f
+                  val outerCandidates = runs.filter { it.c in 45f..150f && (ring.isNaN() || it.c > ring + 8f) }
+                  val innerCandidates = runs.filter { it.c in 35f..145f && (ring.isNaN() || it.c < ring - 8f) }
+
+                  val outerRun = outerCandidates.maxByOrNull { it.score + it.c * 0.20f }
+                  val innerRun = innerCandidates.maxByOrNull { it.score + it.c * 0.008f }
+
+                  val inner: Float
+                  val outer: Float
+                  if (outerRun != null && innerRun != null && outerRun.c - innerRun.c in 24f..58f) {
+                      inner = innerRun.c
+                      outer = outerRun.c
+                  } else if (outerRun != null) {
+                      outer = outerRun.c
+                      inner = outer - widthGuess
+                  } else if (innerRun != null) {
+                      inner = innerRun.c
+                      outer = inner + widthGuess
+                  } else {
+                      inner = Float.NaN
+                      outer = Float.NaN
+                  }
+
+                  if (ring.isNaN() && inner.isNaN() && outer.isNaN()) return null
+                  val gold = ringRun?.gold == true || runs.any { it.gold && !ring.isNaN() && kotlin.math.abs(it.c - ring) < 8f }
+                  return Reading(ring, inner, outer, gold, cx.toFloat(), cy.toFloat())
               }
           }
           EOF_MB
@@ -226,125 +333,143 @@ jobs:
            */
           class Controller {
               companion object {
-                  const val BRAKE = 100f
-                  const val SAFE_OUT = 2f
+                  const val SAFE = 3f
+                  const val BRAKE = 75f
               }
+
               var zonePos = 0.5f
-              var leadSec = 0.26f
+              var leadSec = 0.18f
+
               private var hold = false
               private var r = Float.NaN
               private var v = 0f
-              private var lastMeas = Float.NaN
-              private var mid = Float.NaN // alvo escolhido na zona, sem antecipação
-              private var geomMid = Float.NaN
-              private var lastGeomMid = Float.NaN
-              private var width = 40f
-              private var vZone = 0f
+              private var lastMeasuredR = Float.NaN
+              private var inner = Float.NaN
+              private var outer = Float.NaN
+              private var zoneWidth = Float.NaN
+              private var lastZoneChange = 0L
+              private var lastSeen = 0L
               private var lastT = 0L
-              private var lastZoneSeen = 0L // atualizado somente com par de bordas válido
-              private var lastAnySeen = 0L
-              var target = Float.NaN; private set
-              val estimatedRing get() = r
+              private var staleFrames = 0
 
-              fun currentMid(now: Long): Float = if (lastZoneSeen != 0L && now - lastZoneSeen < 400L) geomMid else Float.NaN
+              var target = Float.NaN
+                  private set
+              val estimatedRing get() = r
+              val estimatedZoneWidth get() = zoneWidth
+
+
+              private fun resetPrediction(now: Long, measured: Float) {
+                  r = measured
+                  v = 0f
+                  lastMeasuredR = measured
+                  lastT = now
+              }
 
               fun update(rd: Detector.Reading?, now: Long): Boolean {
-                  val dt = if (lastT == 0L) 0.033f else ((now - lastT) / 1000f).coerceIn(0.005f, 0.2f)
+                  val dt = if (lastT == 0L) 0.033f else ((now - lastT) / 1000f).coerceIn(0.008f, 0.12f)
                   lastT = now
 
-                  // Previsão física simples entre leituras; a próxima medição corrige a estimativa.
+                  // Primeiro, prevê somente o movimento do anel controlado.
                   if (!r.isNaN()) {
-                      val acceleration = (if (hold) -40f else 43f) - 2.5f * v
-                      v = (v + acceleration * dt).coerceIn(-140f, 140f)
-                      r = (r + v * dt).coerceIn(0f, 170f)
+                      val accel = if (hold) -52f else 52f
+                      v = (v + (accel - 2.8f * v) * dt).coerceIn(-150f, 150f)
+                      r += v * dt
                   }
 
-                  if (rd == null) lastMeas = Float.NaN
-                  if (rd != null) {
-                      val hasR = !rd.ring.isNaN() && rd.ring in 0f..170f
-                      val hasI = !rd.inner.isNaN() && rd.inner in 0f..150f
-                      val hasO = !rd.outer.isNaN() && rd.outer in 0f..150f
-                      if (hasR || hasI || hasO) lastAnySeen = now
+                  if (rd == null) {
+                      staleFrames++
+                  } else {
+                      staleFrames = 0
 
-                      if (hasR) {
-                          if (!lastMeas.isNaN()) {
-                              val measuredV = ((rd.ring - lastMeas) / dt).coerceIn(-120f, 120f)
-                              v = (0.5f * v + 0.5f * measuredV).coerceIn(-140f, 140f)
+                      if (!rd.ring.isNaN() && rd.ring in 15f..145f) {
+                          if (lastMeasuredR.isNaN()) {
+                              resetPrediction(now, rd.ring)
+                          } else {
+                              val measuredV = ((rd.ring - lastMeasuredR) / dt).coerceIn(-180f, 180f)
+                              // A medição manda; o modelo só suaviza ruído de 1-2 pixels.
+                              v = (0.72f * v + 0.28f * measuredV).coerceIn(-160f, 160f)
+                              r = rd.ring
+                              lastMeasuredR = rd.ring
                           }
-                          lastMeas = rd.ring
-                          r = rd.ring
                       } else {
-                          lastMeas = Float.NaN
+                          lastMeasuredR = Float.NaN
                       }
 
-                      if (hasI && hasO) {
-                          val observedWidth = rd.outer - rd.inner
-                          if (observedWidth in 28f..46f) {
-                              val observedMid = (rd.inner + rd.outer) / 2f
-                              if (!lastGeomMid.isNaN() && lastZoneSeen != 0L) {
-                                  val ageMs = now - lastZoneSeen
-                                  val delta = observedMid - lastGeomMid
-                                  if (ageMs in 1L..300L) {
-                                      val measuredZoneV = (delta / (ageMs / 1000f)).coerceIn(-100f, 100f)
-                                      // Salto plausível: pode ser SURGE. Reduzimos o filtro, sem deixar a velocidade ilimitada.
-                                      vZone = if (kotlin.math.abs(delta) < 12f)
-                                          (0.65f * vZone + 0.35f * measuredZoneV).coerceIn(-100f, 100f)
-                                      else
-                                          (0.25f * vZone + 0.75f * measuredZoneV).coerceIn(-100f, 100f)
-                                  } else {
-                                      vZone = 0f
-                                  }
-                              } else {
-                                  vZone = 0f
+                      if (!rd.inner.isNaN() && !rd.outer.isNaN()) {
+                          val ni = minOf(rd.inner, rd.outer)
+                          val no = maxOf(rd.inner, rd.outer)
+                          val nw = no - ni
+                          if (nw in 24f..60f) {
+                              val oldW = zoneWidth
+                              inner = ni
+                              outer = no
+                              zoneWidth = nw
+                              lastSeen = now
+                              if (!oldW.isNaN() && kotlin.math.abs(nw - oldW) > 8f) {
+                                  // SURGE: a faixa mudou de tamanho. Não transforme isso em velocidade da zona.
+                                  lastZoneChange = now
+                                  target = inner + zonePos.coerceIn(0f, 1f) * zoneWidth
                               }
-                              width = observedWidth
-                              geomMid = observedMid
-                              lastGeomMid = observedMid
-                              mid = rd.inner + zonePos.coerceIn(0f, 1f) * observedWidth
-                              lastZoneSeen = now
                           }
-                      } else if (hasO && lastZoneSeen != 0L && now - lastZoneSeen < 250L) {
-                          // Usa uma única borda só por pouco tempo, sem renovar a validade da zona.
-                          mid = rd.outer - (1f - zonePos.coerceIn(0f, 1f)) * width
-                      } else if (hasI && lastZoneSeen != 0L && now - lastZoneSeen < 250L) {
-                          mid = rd.inner + zonePos.coerceIn(0f, 1f) * width
                       }
                   }
 
-                  // Tela/menu ou perda prolongada do detector: libera o toque e apaga o estado antigo.
-                  if (lastAnySeen == 0L || now - lastAnySeen > 700L) {
-                      hold = false; r = Float.NaN; v = 0f; vZone = 0f; target = Float.NaN
+                  // Sem leitura do anel por muito tempo: não inventar posição.
+                  if (lastSeen == 0L || now - lastSeen > 450L || staleFrames > 12) {
+                      hold = false
+                      target = Float.NaN
                       return false
                   }
-                  // Não perseguir uma zona antiga quando não há par de bordas confirmado.
-                  if (lastZoneSeen == 0L || now - lastZoneSeen > 400L) {
-                      hold = false; vZone = 0f; target = Float.NaN
+                  if (r.isNaN() || inner.isNaN() || outer.isNaN()) {
+                      hold = false
+                      target = Float.NaN
                       return false
                   }
-                  if (mid.isNaN() || r.isNaN()) return hold
 
-                  // Compensa o deslocamento da zona durante o atraso, mas limita a previsão a 1/4 da faixa.
-                  val ahead = (leadSec.coerceIn(0f, 0.5f) * vZone).coerceIn(-0.25f * width, 0.25f * width)
-                  val innerEdge = mid - zonePos.coerceIn(0f, 1f) * width
-                  val outerEdge = innerEdge + width
-                  // A previsão não pode empurrar o alvo para fora da faixa, inclusive nos extremos do slider.
-                  target = (mid + ahead).coerceIn(innerEdge + 2f, outerEdge - 2f)
-                  val brakingDistance = v * kotlin.math.abs(v) / (2f * BRAKE)
-                  val predictedRing = r + leadSec.coerceIn(0f, 0.5f) * v + brakingDistance
-                  val error = predictedRing - (target + SAFE_OUT)
+                  // O alvo é uma fração da zona ATUAL. Não aplicamos velocidade da zona:
+                  // nos frames enviados, SURGE altera o tamanho da zona, não sua posição.
+                  val p = zonePos.coerceIn(0.08f, 0.92f)
+                  target = inner + p * zoneWidth
 
-                  // A borda interna é o risco prioritário; soltar cedo é mais seguro do que insistir.
-                  if (v < 0f && predictedRing < innerEdge + 4f) hold = false
-                  else if (error > 1.5f) hold = true
-                  else if (error < -1.5f) hold = false
+                  // Previsão curta do próprio anel para compensar o atraso do toque.
+                  val lead = leadSec.coerceIn(0.04f, 0.32f)
+                  val braking = (v * kotlin.math.abs(v)) / (2f * BRAKE)
+                  val predicted = r + v * lead + braking
+
+                  val low = inner + SAFE
+                  val high = outer - SAFE
+                  if (high <= low) {
+                      hold = false
+                      return false
+                  }
+
+                  // Controle por duas bordas: a proximidade da borda tem prioridade sobre o alvo central.
+                  val dangerIn = predicted <= low + 1.5f
+                  val dangerOut = predicted >= high - 1.5f
+
+                  hold = when {
+                      dangerOut -> true          // ficou grande demais -> encolher
+                      dangerIn -> false          // ficou pequeno demais -> expandir
+                      predicted > target + 1.0f -> true
+                      predicted < target - 1.0f -> false
+                      else -> hold               // histerese para não ficar alternando
+                  }
                   return hold
               }
 
               fun reset() {
-                  hold = false; r = Float.NaN; v = 0f; vZone = 0f
-                  mid = Float.NaN; geomMid = Float.NaN; lastGeomMid = Float.NaN
-                  lastMeas = Float.NaN; lastT = 0L; lastZoneSeen = 0L; lastAnySeen = 0L
-                  width = 40f; target = Float.NaN
+                  hold = false
+                  r = Float.NaN
+                  v = 0f
+                  lastMeasuredR = Float.NaN
+                  inner = Float.NaN
+                  outer = Float.NaN
+                  zoneWidth = Float.NaN
+                  lastZoneChange = 0L
+                  lastSeen = 0L
+                  lastT = 0L
+                  staleFrames = 0
+                  target = Float.NaN
               }
           }
           EOF_MB
@@ -485,7 +610,7 @@ jobs:
               private var wm: WindowManager? = null
               @Volatile private var enabled = false
               private var lastCfg = 0L
-              private var cx = 0.675f; private var cy = 0.510f
+              private var cx = 0.500f; private var cy = 0.500f
               private var tx = 0.68f; private var ty = 0.60f
               private var frames = 0; private var lastUi = 0L
               private var frameErrors = 0
@@ -534,7 +659,7 @@ jobs:
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
                   controller.zonePos = p.getFloat("gap", 50f) / 100f
                   controller.leadSec = p.getFloat("lead2", 260f) / 1000f
-                  cx = p.getFloat("cx", 67.5f) / 100f; cy = p.getFloat("cy", 51.0f) / 100f
+                  cx = p.getFloat("cx", 50.0f) / 100f; cy = p.getFloat("cy", 50.0f) / 100f
                   tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
               }
 
@@ -544,7 +669,10 @@ jobs:
                       val now = SystemClock.uptimeMillis()
                       if (now - lastCfg > 700) { loadCfg(); lastCfg = now }
                       val pl = img.planes[0]
-                      val rd = Detector.analyze(pl.buffer, pl.rowStride, pl.pixelStride, w, h, cx, cy, controller.currentMid(now))
+                      val rd = Detector.analyze(
+                          pl.buffer, pl.rowStride, pl.pixelStride, w, h, cx, cy,
+                          controller.estimatedRing, controller.estimatedZoneWidth
+                      )
                       val svc = BotAccessibilityService.instance
                       val hold: Boolean
                       if (enabled) {
@@ -558,8 +686,10 @@ jobs:
                       if (now - lastUi > 150) {
                           lastUi = now
                           val txt = (if (enabled) "ON " else "OFF") + (if (svc == null) " (sem acessib.)" else "") +
-                              if (rd != null) " R=%.0f%s I=%.0f O=%.0f alvo=%.0f %s%s".format(if (rd.ring.isNaN()) controller.estimatedRing else rd.ring,
-                                  if (rd.ring.isNaN()) "~" else "", rd.inner, rd.outer, controller.target,
+                              if (rd != null) " R=%.0f I=%.0f O=%.0f alvo=%.0f C=%d,%d %s%s".format(
+                                  if (rd.ring.isNaN()) controller.estimatedRing else rd.ring,
+                                  rd.inner, rd.outer, controller.target,
+                                  rd.centerX.toInt(), rd.centerY.toInt(),
                                   if (hold) "SEGURA" else "solta", if (rd.gold) " *" else "") else " sem leitura"
                           val diag = " | quadros_err=%d toque ok=%d canc=%d falha=%d".format(frameErrors, BotAccessibilityService.okCount, BotAccessibilityService.cancelCount, BotAccessibilityService.failCount)
                           overlay?.post { overlay?.text = txt + diag }
@@ -692,8 +822,8 @@ jobs:
                   }
                   slider("Posição na zona (0=interno, 100=externo)", "gap", 0f, 100f, 50f, " %")
                   slider("Antecipação (atraso do jogo)", "lead2", 0f, 500f, 260f, " ms")
-                  slider("Centro do círculo X", "cx", 60f, 75f, 67.5f, " %")
-                  slider("Centro do círculo Y", "cy", 40f, 65f, 51.0f, " %")
+                  slider("Centro do círculo X", "cx", 35f, 65f, 50.0f, " %")
+                  slider("Centro do círculo Y", "cy", 30f, 70f, 50.0f, " %")
                   slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
                   slider("Ponto de toque Y", "ty", 45f, 80f, 60f, " %")
                   setContentView(ScrollView(this).apply { addView(root) })
