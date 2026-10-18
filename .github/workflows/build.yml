@@ -309,22 +309,32 @@ jobs:
           import android.graphics.Path
           import android.os.Handler
           import android.os.Looper
+          import android.os.SystemClock
           import android.view.accessibility.AccessibilityEvent
 
-          /** Segura/solta a tela encadeando traços contínuos (continueStroke). */
+          /**
+           * Segura/solta a tela com UM traço longo (sem continueStroke, que estava cancelando/recompletando
+           * ~250x por segundo e travando a thread principal). Segurar = despacha um toque de 55 s.
+           * Soltar = despacha um toque de 1 ms no mesmo ponto (um novo gesto cancela o anterior, o dedo sobe).
+           * Há intervalo mínimo entre despachos e recuo se o sistema cancelar o toque logo após começar.
+           */
           class BotAccessibilityService : AccessibilityService() {
               companion object {
                   @Volatile var instance: BotAccessibilityService? = null
-                  private const val SEG_MS = 60L
-                  @Volatile var okCount = 0
-                  @Volatile var cancelCount = 0
-                  @Volatile var failCount = 0
+                  private const val HOLD_MS = 55000L
+                  private const val MIN_GAP_MS = 25L
+                  @Volatile var okCount = 0        // despachos aceitos
+                  @Volatile var cancelCount = 0    // cancelados pelo sistema (não por nós)
+                  @Volatile var failCount = 0      // despacho recusado
               }
 
               private val main = Handler(Looper.getMainLooper())
-              private var stroke: StrokeDescription? = null
-              private var busy = false
               @Volatile private var wantHold = false
+              private var holding = false
+              private var seq = 0
+              private var lastDispatch = 0L
+              private var pressedAt = 0L
+              private var retryPending = false
               var x = 0f; var y = 0f
 
               override fun onServiceConnected() { instance = this }
@@ -332,37 +342,55 @@ jobs:
               override fun onInterrupt() { setHold(false) }
               override fun onDestroy() { instance = null; super.onDestroy() }
 
-              fun setHold(h: Boolean) { wantHold = h; main.post { pump() } }
+              fun setHold(h: Boolean) { wantHold = h; main.post { sync() } }
 
-              private fun path(): Path = Path().apply { moveTo(x, y) }
+              private fun later(ms: Long) {
+                  if (retryPending) return
+                  retryPending = true
+                  main.postDelayed({ retryPending = false; sync() }, ms)
+              }
 
-              private fun pump() {
-                  if (busy) return
-                  val s = stroke
-                  val next: StrokeDescription = when {
-                      s == null && wantHold -> StrokeDescription(path(), 0, SEG_MS, true)
-                      s != null && wantHold -> s.continueStroke(path(), 0, SEG_MS, true)
-                      s != null && !wantHold -> s.continueStroke(path(), 0, 1, false)
-                      else -> return
-                  }
-                  val ending = !next.willContinue()
-                  busy = true
+              private fun sync() {
+                  try {
+                      if (wantHold == holding) return
+                      val wait = MIN_GAP_MS - (SystemClock.uptimeMillis() - lastDispatch)
+                      if (wait > 0) { later(wait); return }
+                      if (wantHold) press() else release()
+                  } catch (e: Exception) { failCount++ }
+              }
+
+              private fun press() {
+                  val id = ++seq
+                  val p = Path().apply { moveTo(x, y) }
                   val ok = dispatchGesture(
-                      GestureDescription.Builder().addStroke(next).build(),
+                      GestureDescription.Builder().addStroke(StrokeDescription(p, 0, HOLD_MS)).build(),
                       object : GestureResultCallback() {
                           override fun onCompleted(g: GestureDescription?) {
-                              okCount++
-                              stroke = if (ending) null else next
-                              busy = false; pump()
+                              // acabou os 55 s: se ainda queremos segurar, pressiona de novo
+                              if (id == seq && holding) { holding = false; sync() }
                           }
                           override fun onCancelled(g: GestureDescription?) {
+                              if (id != seq || !holding) return   // cancelado por nós (soltar): ignora
                               cancelCount++
-                              stroke = null; busy = false; pump()
+                              holding = false
+                              // se o sistema cancelou logo após começar, espera antes de tentar de novo (sem laço quente)
+                              later(if (SystemClock.uptimeMillis() - pressedAt < 150) 200L else MIN_GAP_MS)
                           }
                       }, null
                   )
-                  if (!ok) { failCount++; busy = false; stroke = null }
-                  else if (!ending) stroke = next
+                  lastDispatch = SystemClock.uptimeMillis()
+                  if (ok) { okCount++; holding = true; pressedAt = lastDispatch } else { failCount++; later(100L) }
+              }
+
+              private fun release() {
+                  seq++            // ignora os callbacks do traço longo
+                  holding = false
+                  val p = Path().apply { moveTo(x, y) }
+                  val ok = dispatchGesture(
+                      GestureDescription.Builder().addStroke(StrokeDescription(p, 0, 1L)).build(), null, null
+                  )
+                  lastDispatch = SystemClock.uptimeMillis()
+                  if (ok) okCount++ else failCount++
               }
           }
           EOF_MB
@@ -409,6 +437,7 @@ jobs:
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
+                  if (projection != null) return START_NOT_STICKY   // já rodando: ignora segundo início (vazava thread/projeção)
                   val nm = getSystemService(NotificationManager::class.java)
                   nm.createNotificationChannel(NotificationChannel("mana", "Mana Bot", NotificationManager.IMPORTANCE_LOW))
                   val n = Notification.Builder(this, "mana").setContentTitle("Mana Bot ativo")
@@ -453,7 +482,7 @@ jobs:
               }
 
               private fun onFrame(r: ImageReader, w: Int, h: Int) {
-                  val img = r.acquireLatestImage() ?: return
+                  val img = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return
                   try {
                       val now = SystemClock.uptimeMillis()
                       if (now - lastCfg > 700) { loadCfg(); lastCfg = now }
@@ -479,7 +508,10 @@ jobs:
                           overlay?.post { overlay?.text = txt + diag }
                           dot?.post { dot?.visibility = if (hold) android.view.View.VISIBLE else android.view.View.INVISIBLE }
                       }
-                  } finally { img.close() }
+                  } catch (e: Exception) {
+                      // nunca deixa uma exceção de quadro derrubar o app: solta e segue no próximo quadro
+                      try { BotAccessibilityService.instance?.setHold(false) } catch (_: Exception) {}
+                  } finally { try { img.close() } catch (_: Exception) {} }
               }
 
               private fun showOverlay() {
@@ -525,10 +557,13 @@ jobs:
               }
 
               override fun onDestroy() {
-                  BotAccessibilityService.instance?.setHold(false)
-                  overlay?.let { wm?.removeView(it) }
-                  dot?.let { wm?.removeView(it) }
-                  vd?.release(); reader?.close(); projection?.stop()
+                  try { BotAccessibilityService.instance?.setHold(false) } catch (_: Exception) {}
+                  try { reader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+                  try { overlay?.let { wm?.removeView(it) } } catch (_: Exception) {}
+                  try { dot?.let { wm?.removeView(it) } } catch (_: Exception) {}
+                  try { vd?.release() } catch (_: Exception) {}
+                  try { reader?.close() } catch (_: Exception) {}
+                  try { projection?.stop() } catch (_: Exception) {}
                   if (::thread.isInitialized) thread.quitSafely()
                   super.onDestroy()
               }
