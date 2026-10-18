@@ -152,7 +152,7 @@ jobs:
                           }
                           rr /= 3; gg /= 3; bb /= 3
                           val isGold = rr > 200 && gg > 140 && bb < 120
-                          val warm = rr > 215 && rr - gg > 55 && bb < 235   // anel laranja/vermelho/rosa
+                          val warm = rr > 215 && rr - gg > 55 && bb < 235
                           gd[i] = isGold
                           bright[i] = isGold || warm || minOf(rr, gg, bb) > 190
                       }
@@ -168,7 +168,6 @@ jobs:
                               i = j + 1
                           } else i++
                       }
-                      // anel grosso mais externo (+ borda interna do par)
                       val thick = runs.filter { it.w >= 3 && it.c in 14f..128f }
                       var ringC = Float.NaN
                       if (thick.isNotEmpty()) {
@@ -178,8 +177,6 @@ jobs:
                           rg.add(ringC)
                           if (thick.any { it.gold }) gold = true
                       }
-                      // zona = par de círculos finos separados ~28..46 px. Escolhe o par mais próximo da zona anterior
-                      // (a zona se move de forma contínua); sem histórico, o mais próximo do anel.
                       val thin = runs.filter { it.w <= 2 && it.c in 14f..133f }.map { it.c }.sorted()
                       var best: Pair<Float, Float>? = null; var bestScore = Float.MAX_VALUE
                       for (a in thin.indices) for (b in a + 1 until thin.size) {
@@ -195,7 +192,6 @@ jobs:
                       }
                       if (best != null) { ins.add(best.first); outs.add(best.second) }
                       else if (!ringC.isNaN()) {
-                          // sem par: um círculo só. Ignora o círculo fixo do pentagrama (~31 px).
                           val lo = thin.filter { it < ringC - 6f && it > 40f }.maxOrNull()
                           val hi = thin.filter { it > ringC + 6f }.minOrNull()
                           if (lo != null && ringC - lo <= 45f) ins.add(lo)
@@ -212,26 +208,17 @@ jobs:
           cat > app/src/main/java/com/manabot/Controller.kt <<'EOF_MB'
           package com.manabot
 
-          /**
-           * O anel grosso (R) é a mana: SEGURAR encolhe, SOLTAR expande. A zona estável é a faixa entre dois
-           * círculos finos (~40 px). Dinâmica medida nos vídeos: a = +43 (solto) / -40 (segurando) - 2.5*v  (px/s^2).
-           * O SURGE move a zona inteira (20-30 px/s para fora ou para dentro): o controle acompanha a velocidade
-           * da zona e mira um pouco à frente dela. Se o anel some (laranja/vermelho/pequeno), o estado é estimado
-           * pelo modelo, em vez de soltar às cegas.
-           */
           class Controller {
               companion object {
-                  const val BRAKE = 100f     // px/s^2 de frenagem efetiva (inclui atraso de resposta)
-                  const val SAFE_OUT = 2f    // mira levemente para fora do meio da zona
+                  const val BRAKE = 100f
+                  const val SAFE_OUT = 2f
               }
               var zonePos = 0.5f
               var leadSec = 0.26f
               private var hold = false
-              // estado estimado do anel
               private var r = Float.NaN
               private var v = 0f
               private var lastMeas = Float.NaN
-              // zona
               private var mid = Float.NaN
               private var width = 40f
               private var vZone = 0f
@@ -246,7 +233,6 @@ jobs:
               fun update(rd: Detector.Reading?, now: Long): Boolean {
                   val dt = if (lastT == 0L) 0.033f else ((now - lastT) / 1000f).coerceIn(0.005f, 0.2f)
                   lastT = now
-                  // 1) propaga o modelo do anel com o último comando
                   if (!r.isNaN()) {
                       val a = (if (hold) -40f else 43f) - 2.5f * v
                       v += a * dt; r = (r + v * dt).coerceIn(0f, 170f)
@@ -262,33 +248,35 @@ jobs:
                           }
                           lastMeas = rd.ring; r = rd.ring
                       } else lastMeas = Float.NaN
-                      // 2) zona
                       var m = Float.NaN
                       if (hasI && hasO) { m = rd.inner + zonePos * (rd.outer - rd.inner); width = rd.outer - rd.inner }
                       else if (hasO) m = rd.outer - width / 2f
                       else if (hasI) m = rd.inner + width / 2f
                       if (!m.isNaN()) {
-                          if (!lastMid.isNaN() && now - lastZoneSeen < 300 && Math.abs(m - lastMid) < 12f) {
-                              val dz = ((m - lastMid) / dt).coerceIn(-45f, 45f)
-                              vZone = 0.7f * vZone + 0.3f * dz
-                          } else vZone = 0f   // salto = par de círculos trocado/reencontrado: não vira "velocidade" da zona
+                          val age = now - lastZoneSeen
+                          val jump = if (!lastMid.isNaN() && age in 1..300) m - lastMid else 0f
+                          val widthPlausible = width in 28f..46f
+                          if (!lastMid.isNaN() && age in 1..300 && widthPlausible) {
+                              if (Math.abs(jump) < 12f) {
+                                  val dz = (jump / dt).coerceIn(-90f, 90f)
+                                  vZone = 0.65f * vZone + 0.35f * dz
+                              } else {
+                                  val dz = (jump / (age / 1000f)).coerceIn(-90f, 90f)
+                                  vZone = 0.25f * vZone + 0.75f * dz
+                              }
+                          } else {
+                              vZone = 0f
+                          }
                           lastMid = m; mid = m; lastZoneSeen = now
                       }
                   }
-                  // 3) nada visível por um tempo (tela de resultado, menu): solta e zera
                   if (now - lastAnySeen > 700) { hold = false; r = Float.NaN; v = 0f; vZone = 0f; target = Float.NaN; return hold }
                   if (mid.isNaN() || r.isNaN()) return hold
-                  // 4) alvo: meio da zona, um pouco à frente do movimento dela
-                  val ahead = (0.4f * vZone).coerceIn(-0.2f * width, 0.2f * width)
+                  val ahead = (0.45f * vZone).coerceIn(-0.35f * width, 0.35f * width)
                   target = mid + (if (now - lastZoneSeen < 400) ahead else 0f)
-                  // Posição prevista: atraso (captura + toque + jogo) E distância de frenagem. Segurando, o anel
-                  // chega a ~-50 px/s e continua caindo mesmo depois de soltar (medido: soltou em R~49 e foi a 20).
-                  // Por isso o termo v*|v|/(2*BRAKE) — sem ele o anel entra no círculo interno e quebra (FAILED).
                   val brake = v * Math.abs(v) / (2f * BRAKE)
                   val pred = r + leadSec * v + brake
-                  // Margem de segurança: errar para dentro é fatal, errar para fora é só recuperável.
                   val e = pred - (target + SAFE_OUT)
-                  // Piso: se o anel previsto cai abaixo do círculo interno da zona, solta SEMPRE.
                   val floorEdge = mid - width / 2f
                   if (v < 0f && pred < floorEdge + 4f) hold = false
                   else if (e > 1.5f) hold = true
@@ -312,20 +300,14 @@ jobs:
           import android.os.SystemClock
           import android.view.accessibility.AccessibilityEvent
 
-          /**
-           * Segura/solta a tela com UM traço longo (sem continueStroke, que estava cancelando/recompletando
-           * ~250x por segundo e travando a thread principal). Segurar = despacha um toque de 55 s.
-           * Soltar = despacha um toque de 1 ms no mesmo ponto (um novo gesto cancela o anterior, o dedo sobe).
-           * Há intervalo mínimo entre despachos e recuo se o sistema cancelar o toque logo após começar.
-           */
           class BotAccessibilityService : AccessibilityService() {
               companion object {
                   @Volatile var instance: BotAccessibilityService? = null
                   private const val HOLD_MS = 55000L
                   private const val MIN_GAP_MS = 25L
-                  @Volatile var okCount = 0        // despachos aceitos
-                  @Volatile var cancelCount = 0    // cancelados pelo sistema (não por nós)
-                  @Volatile var failCount = 0      // despacho recusado
+                  @Volatile var okCount = 0
+                  @Volatile var cancelCount = 0
+                  @Volatile var failCount = 0
               }
 
               private val main = Handler(Looper.getMainLooper())
@@ -366,14 +348,12 @@ jobs:
                       GestureDescription.Builder().addStroke(StrokeDescription(p, 0, HOLD_MS)).build(),
                       object : GestureResultCallback() {
                           override fun onCompleted(g: GestureDescription?) {
-                              // acabou os 55 s: se ainda queremos segurar, pressiona de novo
                               if (id == seq && holding) { holding = false; sync() }
                           }
                           override fun onCancelled(g: GestureDescription?) {
-                              if (id != seq || !holding) return   // cancelado por nós (soltar): ignora
+                              if (id != seq || !holding) return
                               cancelCount++
                               holding = false
-                              // se o sistema cancelou logo após começar, espera antes de tentar de novo (sem laço quente)
                               later(if (SystemClock.uptimeMillis() - pressedAt < 150) 200L else MIN_GAP_MS)
                           }
                       }, null
@@ -383,7 +363,7 @@ jobs:
               }
 
               private fun release() {
-                  seq++            // ignora os callbacks do traço longo
+                  seq++
                   holding = false
                   val p = Path().apply { moveTo(x, y) }
                   val ok = dispatchGesture(
@@ -429,7 +409,7 @@ jobs:
               private var wm: WindowManager? = null
               @Volatile private var enabled = false
               private var lastCfg = 0L
-              private var cx = 0.499f; private var cy = 0.498f
+              private var cx = 0.675f; private var cy = 0.510f
               private var tx = 0.68f; private var ty = 0.60f
               private var frames = 0; private var lastUi = 0L
 
@@ -437,7 +417,7 @@ jobs:
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
-                  if (projection != null) return START_NOT_STICKY   // já rodando: ignora segundo início (vazava thread/projeção)
+                  if (projection != null) return START_NOT_STICKY
                   val nm = getSystemService(NotificationManager::class.java)
                   nm.createNotificationChannel(NotificationChannel("mana", "Mana Bot", NotificationManager.IMPORTANCE_LOW))
                   val n = Notification.Builder(this, "mana").setContentTitle("Mana Bot ativo")
@@ -457,7 +437,6 @@ jobs:
                       override fun onStop() { stopSelf() }
                   }, handler)
 
-                  // Sempre paisagem: lado maior = largura. Em retrato o conteúdo aparece pequeno até o Roblox girar a tela.
                   val dm = resources.displayMetrics
                   val long = maxOf(dm.widthPixels, dm.heightPixels).toFloat()
                   val short = minOf(dm.widthPixels, dm.heightPixels).toFloat()
@@ -477,7 +456,7 @@ jobs:
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
                   controller.zonePos = p.getFloat("gap", 50f) / 100f
                   controller.leadSec = p.getFloat("lead2", 260f) / 1000f
-                  cx = p.getFloat("cx", 49.9f) / 100f; cy = p.getFloat("cy", 49.8f) / 100f
+                  cx = p.getFloat("cx", 67.5f) / 100f; cy = p.getFloat("cy", 51.0f) / 100f
                   tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
               }
 
@@ -509,7 +488,6 @@ jobs:
                           dot?.post { dot?.visibility = if (hold) android.view.View.VISIBLE else android.view.View.INVISIBLE }
                       }
                   } catch (e: Exception) {
-                      // nunca deixa uma exceção de quadro derrubar o app: solta e segue no próximo quadro
                       try { BotAccessibilityService.instance?.setHold(false) } catch (_: Exception) {}
                   } finally { try { img.close() } catch (_: Exception) {} }
               }
@@ -534,12 +512,11 @@ jobs:
                               if (Math.abs(e.rawX - sx) > 12 || Math.abs(e.rawY - sy) > 12) moved = true
                               if (moved) { lp.x = ox + (e.rawX - sx).toInt(); lp.y = oy + (e.rawY - sy).toInt(); wm?.updateViewLayout(tv, lp) }
                           }
-                          MotionEvent.ACTION_UP -> if (!moved) { enabled = !enabled }   // toque = liga/desliga
+                          MotionEvent.ACTION_UP -> if (!moved) { enabled = !enabled }
                       }
                       true
                   }
                   try { wm!!.addView(tv, lp); overlay = tv } catch (e: Exception) { stopSelf(); return }
-                  // bolinha vermelha = onde o app está tocando (aparece só enquanto SEGURA)
                   val dm = resources.displayMetrics
                   val lw = maxOf(dm.widthPixels, dm.heightPixels); val lh = minOf(dm.widthPixels, dm.heightPixels)
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
@@ -625,8 +602,8 @@ jobs:
                   }
                   slider("Posição na zona (0=interno, 100=externo)", "gap", 0f, 100f, 50f, " %")
                   slider("Antecipação (atraso do jogo)", "lead2", 0f, 500f, 260f, " ms")
-                  slider("Centro do círculo X", "cx", 44f, 56f, 49.9f, " %")
-                  slider("Centro do círculo Y", "cy", 44f, 56f, 49.8f, " %")
+                  slider("Centro do círculo X", "cx", 60f, 75f, 67.5f, " %")
+                  slider("Centro do círculo Y", "cy", 40f, 65f, 51.0f, " %")
                   slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
                   slider("Ponto de toque Y", "ty", 45f, 80f, 60f, " %")
                   setContentView(ScrollView(this).apply { addView(root) })
