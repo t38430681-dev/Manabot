@@ -1,4 +1,4 @@
-name: Build APK
+name: ManaBot Android Build v4
 on: [push, workflow_dispatch]
 jobs:
   build:
@@ -242,8 +242,8 @@ jobs:
               private var previousZoneMid = Float.NaN
               private var lastTime = 0L
               private var lastZoneSeen = 0L
+              private var lastRingSeen = 0L
               private var lastAnySeen = 0L
-              private var previousVelocity = 0f
               private var estimatedAcceleration = 0f
               var target = Float.NaN; private set
               val estimatedRing get() = ring
@@ -275,6 +275,7 @@ jobs:
                           }
                           previousMeasurement = rd.ring
                           ring = rd.ring
+                          lastRingSeen = now
                       }
           
                       if (hasInner && hasOuter && rd.outer > rd.inner + 12f && rd.outer - rd.inner < 60f) {
@@ -310,8 +311,10 @@ jobs:
           
                   val ageAny = now - lastAnySeen
                   val ageZone = now - lastZoneSeen
-                  // If the image stream stalls, release instead of continuing on stale coordinates.
-                  if (ageAny > 180L || ageZone > 220L) {
+                  val ageRing = now - lastRingSeen
+                  // Each signal has its own freshness clock: fresh zone edges must not hide a stale ring.
+                  // Release promptly whenever the controlled ring itself has not been measured recently.
+                  if (ageAny > 180L || ageZone > 220L || ageRing > 165L) {
                       hold = false
                       if (ageAny > 700L) reset()
                       return false
@@ -341,7 +344,6 @@ jobs:
                       predictedRing < target - margin -> hold = false
                       // Inside the dead band, preserve the command to avoid rapid gesture chatter.
                   }
-                  previousVelocity = velocity
                   return hold
               }
           
@@ -350,8 +352,8 @@ jobs:
                   ring = Float.NaN; velocity = 0f; previousMeasurement = Float.NaN
                   targetInner = Float.NaN; targetOuter = Float.NaN; zoneMid = Float.NaN
                   zoneVelocity = 0f; previousZoneMid = Float.NaN
-                  lastTime = 0L; lastZoneSeen = 0L; lastAnySeen = 0L
-                  estimatedAcceleration = 0f; previousVelocity = 0f; target = Float.NaN
+                  lastTime = 0L; lastZoneSeen = 0L; lastRingSeen = 0L; lastAnySeen = 0L
+                  estimatedAcceleration = 0f; target = Float.NaN
               }
           }
           EOF_MB
@@ -758,6 +760,20 @@ jobs:
                   assertTrue("radius drifted outside the safe test band: $radius", radius in 62f..99f)
                   assertFalse(controller.update(null, now + 1_000L))
               }
+          
+              @Test fun freshZoneCannotMaskStaleControlledRing() {
+                  val controller = Controller().apply { leadSec = .1f; zonePos = .5f }
+                  var now = 10_000L
+                  val valid = Detector.Reading(80f, 69f, 92f, false, 1f)
+                  controller.update(valid, now)
+                  // The zone remains visible, but the controlled ring detector has lost the ring.
+                  repeat(7) {
+                      now += 33L
+                      controller.update(Detector.Reading(Float.NaN, 69f, 92f, false, .5f), now)
+                  }
+                  assertFalse("controller must release when ring measurements go stale", controller.update(Detector.Reading(Float.NaN, 69f, 92f, false, .5f), now + 1L))
+              }
+          
           }
           EOF_MB
       - uses: actions/setup-java@v4
@@ -771,5 +787,5 @@ jobs:
       - name: Compilar APK
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
-        with: { name: ManaBot-apk, path: app/build/outputs/apk/debug/app-debug.apk }
+        with: { name: ManaBot-v4-apk, path: app/build/outputs/apk/debug/app-debug.apk }
 
