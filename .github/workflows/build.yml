@@ -149,8 +149,10 @@ jobs:
                           }
                           rr /= 3; gg /= 3; bb /= 3
                           val isGold = rr > 200 && gg > 140 && bb < 120
+                          // laranja/vermelho/rosa vivo: cores do anel durante SURGE ou fora da zona
+                          val warm = rr > 215 && rr - gg > 55 && bb < 235
                           gd[i] = isGold
-                          bright[i] = isGold || minOf(rr, gg, bb) > 190
+                          bright[i] = isGold || warm || minOf(rr, gg, bb) > 190
                       }
                       val runs = ArrayList<Run>()
                       var i = 0
@@ -165,7 +167,7 @@ jobs:
                           } else i++
                       }
                       // anel: run grosso mais externo (+ a borda interna, se for o par de bordas)
-                      val thick = runs.filter { it.w >= 3 && it.c in 20f..128f }
+                      val thick = runs.filter { it.w >= 3 && it.c in 14f..128f }
                       if (thick.isEmpty()) continue
                       val outerThick = thick.maxByOrNull { it.c }!!
                       val inner = thick.filter { it !== outerThick && outerThick.c - it.c <= 10f }.maxByOrNull { it.c }
@@ -194,46 +196,73 @@ jobs:
           package com.manabot
 
           /**
-           * O anel grosso (R) é a mana: SEGURAR encolhe, SOLTAR expande (confirmado no teste real).
-           * A zona estável é a faixa entre dois círculos finos (I < O). Fica dourado quando o anel está dentro.
-           * Objetivo: manter R na posição `zonePos` (0=círculo interno, 1=externo) entre I e O.
-           * Zona que encolhe/expande e os "SURGE" só mudam o alvo ou a deriva: o laço fechado compensa.
+           * Medido nos seus vídeos: o anel (R) anda a -20 px/s segurando e +20 px/s soltando (atraso ~0,15 s).
+           * A zona (círculos finos I < O) se move sozinha (até ~10-30 px/s). Objetivo: manter R dentro da zona.
+           * Se só uma das linhas da zona aparece, a outra é inferida pela largura lembrada (W).
+           * Controle: liga/desliga com antecipação do atraso e da velocidade do alvo.
            */
           class Controller {
-              var zonePos = 0.5f
-              var leadSec = 0.08f
+              var zonePos = 0.5f          // 0 = círculo interno, 1 = externo
+              var leadSec = 0.15f         // atraso do jogo/toque
               private var hold = false
               private var lastR = Float.NaN
               private var lastT = 0L
               private var dR = 0f
               private var lastSeen = 0L
+
+              private var w = 40f                 // largura lembrada da zona
+              private var m = Float.NaN           // centro suavizado da zona
+              private var dM = 0f
+              private var lastM = Float.NaN
+              private var lastMT = 0L
+              private var mAge = 0L
+
               var target = Float.NaN; private set
+              private var lastTarget = Float.NaN
+              var zoneInferred = false; private set
 
               fun update(rd: Detector.Reading?, now: Long): Boolean {
                   if (rd == null) {
-                      if (now - lastSeen > 250) hold = false
+                      // sem leitura (ex.: anel apagou no SURGE): decide pelo último estado conhecido
+                      if (now - lastSeen > 150 && !lastR.isNaN() && !lastTarget.isNaN()) hold = lastR + leadSec * dR > lastTarget
+                      else if (now - lastSeen > 150) hold = false
                       return hold
                   }
                   lastSeen = now
                   val hasI = !rd.inner.isNaN(); val hasO = !rd.outer.isNaN()
-                  target = when {
-                      hasI && hasO -> rd.inner + zonePos * (rd.outer - rd.inner)
-                      hasO -> rd.outer - 10f
-                      hasI -> rd.inner + 10f
-                      else -> Float.NaN
+                  var mNow = Float.NaN
+                  zoneInferred = false
+                  if (hasI && hasO) {
+                      val ww = rd.outer - rd.inner
+                      if (ww in 8f..90f) w = 0.8f * w + 0.2f * ww
+                      mNow = (rd.inner + rd.outer) / 2f; mAge = now
+                  } else if (hasO) { mNow = rd.outer - w / 2f; zoneInferred = true; mAge = now }
+                  else if (hasI) { mNow = rd.inner + w / 2f; zoneInferred = true; mAge = now }
+                  else if (rd.gold) { mNow = rd.ring; zoneInferred = true }          // dourado: anel está dentro da zona
+                  else if (!m.isNaN() && now - mAge < 700) { mNow = m + dM * (now - lastMT) / 1000f; zoneInferred = true }
+
+                  if (!mNow.isNaN()) {
+                      if (!m.isNaN() && now > lastMT) {
+                          val d = (mNow - m) / ((now - lastMT) / 1000f)
+                          dM = 0.7f * dM + 0.3f * d.coerceIn(-60f, 60f)
+                      }
+                      m = if (m.isNaN()) mNow else 0.5f * m + 0.5f * mNow
+                      lastMT = now
                   }
                   if (!lastR.isNaN() && now > lastT) {
                       val d = (rd.ring - lastR) / ((now - lastT) / 1000f)
                       dR = 0.6f * dR + 0.4f * d.coerceIn(-120f, 120f)
                   }
                   lastR = rd.ring; lastT = now
-                  if (target.isNaN()) return hold          // sem referência: mantém o último comando
-                  val e = rd.ring + leadSec * dR - target
-                  if (e > 1.5f) hold = true else if (e < -1.5f) hold = false
+                  if (!target.isNaN()) lastTarget = target
+                  if (m.isNaN()) { target = Float.NaN; return hold }
+                  target = m + (zonePos - 0.5f) * w
+                  val e = (rd.ring + leadSec * dR) - (target + leadSec * dM)
+                  if (e > 2f) hold = true else if (e < -2f) hold = false
                   return hold
               }
 
-              fun reset() { hold = false; lastR = Float.NaN; dR = 0f }
+              fun reset() { hold = false; lastR = Float.NaN; dR = 0f; m = Float.NaN; dM = 0f }
           }
           EOF_MB
           mkdir -p $(dirname app/src/main/java/com/manabot/BotAccessibilityService.kt)
@@ -252,7 +281,10 @@ jobs:
           class BotAccessibilityService : AccessibilityService() {
               companion object {
                   @Volatile var instance: BotAccessibilityService? = null
-                  private const val SEG_MS = 40L
+                  private const val SEG_MS = 60L
+                  @Volatile var okCount = 0
+                  @Volatile var cancelCount = 0
+                  @Volatile var failCount = 0
               }
 
               private val main = Handler(Looper.getMainLooper())
@@ -285,15 +317,17 @@ jobs:
                       GestureDescription.Builder().addStroke(next).build(),
                       object : GestureResultCallback() {
                           override fun onCompleted(g: GestureDescription?) {
+                              okCount++
                               stroke = if (ending) null else next
                               busy = false; pump()
                           }
                           override fun onCancelled(g: GestureDescription?) {
+                              cancelCount++
                               stroke = null; busy = false; pump()
                           }
                       }, null
                   )
-                  if (!ok) { busy = false; stroke = null }
+                  if (!ok) { failCount++; busy = false; stroke = null }
                   else if (!ending) stroke = next
               }
           }
@@ -329,6 +363,7 @@ jobs:
               private lateinit var thread: HandlerThread
               private val controller = Controller()
               private var overlay: TextView? = null
+              private var dot: android.view.View? = null
               private var wm: WindowManager? = null
               @Volatile private var enabled = false
               private var lastCfg = 0L
@@ -378,7 +413,7 @@ jobs:
               private fun loadCfg() {
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
                   controller.zonePos = p.getFloat("gap", 50f) / 100f
-                  controller.leadSec = p.getFloat("lead", 80f) / 1000f
+                  controller.leadSec = p.getFloat("lead", 150f) / 1000f
                   cx = p.getFloat("cx", 49.9f) / 100f; cy = p.getFloat("cy", 49.8f) / 100f
                   tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
               }
@@ -405,7 +440,9 @@ jobs:
                           val txt = (if (enabled) "ON " else "OFF") + (if (svc == null) " (sem acessib.)" else "") +
                               if (rd != null) " R=%.0f I=%.0f O=%.0f alvo=%.0f %s%s".format(rd.ring, rd.inner, rd.outer, controller.target,
                                   if (hold) "SEGURA" else "solta", if (rd.gold) " *" else "") else " sem leitura"
-                          overlay?.post { overlay?.text = txt }
+                          val diag = " | toque ok=%d canc=%d falha=%d".format(BotAccessibilityService.okCount, BotAccessibilityService.cancelCount, BotAccessibilityService.failCount)
+                          overlay?.post { overlay?.text = txt + diag }
+                          dot?.post { dot?.visibility = if (hold) android.view.View.VISIBLE else android.view.View.INVISIBLE }
                       }
                   } finally { img.close() }
               }
@@ -434,12 +471,28 @@ jobs:
                       }
                       true
                   }
-                  try { wm!!.addView(tv, lp); overlay = tv } catch (e: Exception) { stopSelf() }
+                  try { wm!!.addView(tv, lp); overlay = tv } catch (e: Exception) { stopSelf(); return }
+                  // bolinha vermelha = onde o app está tocando (aparece só enquanto SEGURA)
+                  val dm = resources.displayMetrics
+                  val lw = maxOf(dm.widthPixels, dm.heightPixels); val lh = minOf(dm.widthPixels, dm.heightPixels)
+                  val p = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val d = android.view.View(this).apply {
+                      background = android.graphics.drawable.GradientDrawable().apply { shape = android.graphics.drawable.GradientDrawable.OVAL; setColor(0x99FF0000.toInt()) }
+                      visibility = android.view.View.INVISIBLE
+                  }
+                  val dl = WindowManager.LayoutParams(
+                      48, 48, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START
+                      x = (p.getFloat("tx", 68f) / 100f * lw).toInt() - 24; y = (p.getFloat("ty", 60f) / 100f * lh).toInt() - 24 }
+                  try { wm!!.addView(d, dl); dot = d } catch (e: Exception) {}
               }
 
               override fun onDestroy() {
                   BotAccessibilityService.instance?.setHold(false)
                   overlay?.let { wm?.removeView(it) }
+                  dot?.let { wm?.removeView(it) }
                   vd?.release(); reader?.close(); projection?.stop()
                   if (::thread.isInitialized) thread.quitSafely()
                   super.onDestroy()
@@ -501,7 +554,7 @@ jobs:
                       root.addView(tv); root.addView(sb)
                   }
                   slider("Posição na zona (0=interno, 100=externo)", "gap", 0f, 100f, 50f, " %")
-                  slider("Antecipação", "lead", 0f, 300f, 80f, " ms")
+                  slider("Antecipação (atraso do jogo)", "lead", 0f, 300f, 150f, " ms")
                   slider("Centro do círculo X", "cx", 44f, 56f, 49.9f, " %")
                   slider("Centro do círculo Y", "cy", 44f, 56f, 49.8f, " %")
                   slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
