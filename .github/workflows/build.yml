@@ -131,7 +131,7 @@ jobs:
 
               fun analyze(
                   buf: ByteBuffer, rowStride: Int, pixStride: Int, w: Int, h: Int,
-                  cxFrac: Float, cyFrac: Float
+                  cxFrac: Float, cyFrac: Float, prevMid: Float = Float.NaN
               ): Reading? {
                   val cx = (cxFrac * w).toInt()
                   val cy = (cyFrac * h).toInt().coerceIn(1, h - 2)
@@ -178,22 +178,28 @@ jobs:
                           rg.add(ringC)
                           if (thick.any { it.gold }) gold = true
                       }
-                      // zona = par de círculos finos separados ~30..46 px
+                      // zona = par de círculos finos separados ~28..46 px. Escolhe o par mais próximo da zona anterior
+                      // (a zona se move de forma contínua); sem histórico, o mais próximo do anel.
                       val thin = runs.filter { it.w <= 2 && it.c in 14f..133f }.map { it.c }.sorted()
                       var best: Pair<Float, Float>? = null; var bestScore = Float.MAX_VALUE
                       for (a in thin.indices) for (b in a + 1 until thin.size) {
                           val sep = thin[b] - thin[a]
                           if (sep < 28f || sep > 46f) continue
                           val mid = (thin[a] + thin[b]) / 2f
-                          val score = if (!ringC.isNaN()) Math.abs(mid - ringC) else -mid   // sem anel: o par mais externo
+                          val score = when {
+                              !prevMid.isNaN() -> Math.abs(mid - prevMid)
+                              !ringC.isNaN() -> Math.abs(mid - ringC)
+                              else -> -mid
+                          }
                           if (score < bestScore) { bestScore = score; best = Pair(thin[a], thin[b]) }
                       }
                       if (best != null) { ins.add(best.first); outs.add(best.second) }
                       else if (!ringC.isNaN()) {
-                          val lo = thin.filter { it < ringC - 6f }.maxOrNull()
+                          // sem par: um círculo só. Ignora o círculo fixo do pentagrama (~31 px).
+                          val lo = thin.filter { it < ringC - 6f && it > 40f }.maxOrNull()
                           val hi = thin.filter { it > ringC + 6f }.minOrNull()
-                          if (lo != null && ringC - lo <= 60f) ins.add(lo)
-                          if (hi != null && hi - ringC <= 60f) outs.add(hi)
+                          if (lo != null && ringC - lo <= 45f) ins.add(lo)
+                          if (hi != null && hi - ringC <= 45f) outs.add(hi)
                       }
                   }
                   if (rg.isEmpty() && ins.isEmpty() && outs.isEmpty()) return null
@@ -215,7 +221,7 @@ jobs:
            */
           class Controller {
               var zonePos = 0.5f
-              var leadSec = 0.22f
+              var leadSec = 0.28f
               private var hold = false
               // estado estimado do anel
               private var r = Float.NaN
@@ -231,6 +237,7 @@ jobs:
               private var lastAnySeen = 0L
               var target = Float.NaN; private set
               val estimatedRing get() = r
+              fun currentMid(now: Long): Float = if (now - lastZoneSeen < 400) mid else Float.NaN
 
               fun update(rd: Detector.Reading?, now: Long): Boolean {
                   val dt = if (lastT == 0L) 0.033f else ((now - lastT) / 1000f).coerceIn(0.005f, 0.2f)
@@ -254,8 +261,8 @@ jobs:
                       // 2) zona
                       var m = Float.NaN
                       if (hasI && hasO) { m = rd.inner + zonePos * (rd.outer - rd.inner); width = rd.outer - rd.inner }
-                      else if (hasO) m = rd.outer - 12f
-                      else if (hasI) m = rd.inner + 12f
+                      else if (hasO) m = rd.outer - width / 2f
+                      else if (hasI) m = rd.inner + width / 2f
                       if (!m.isNaN()) {
                           if (!lastMid.isNaN() && now - lastZoneSeen < 300) {
                               val dz = ((m - lastMid) / dt).coerceIn(-80f, 80f)
@@ -437,7 +444,7 @@ jobs:
                       val now = SystemClock.uptimeMillis()
                       if (now - lastCfg > 700) { loadCfg(); lastCfg = now }
                       val pl = img.planes[0]
-                      val rd = Detector.analyze(pl.buffer, pl.rowStride, pl.pixelStride, w, h, cx, cy)
+                      val rd = Detector.analyze(pl.buffer, pl.rowStride, pl.pixelStride, w, h, cx, cy, controller.currentMid(now))
                       val svc = BotAccessibilityService.instance
                       val hold: Boolean
                       if (enabled) {
