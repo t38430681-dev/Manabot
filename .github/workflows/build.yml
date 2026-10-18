@@ -135,7 +135,7 @@ jobs:
               ): Reading? {
                   val cx = (cxFrac * w).toInt()
                   val cy = (cyFrac * h).toInt().coerceIn(1, h - 2)
-                  val rmax = 140
+                  val rmax = 190
                   if (cx - rmax < 0 || cx + rmax >= w) return null
                   val rg = ArrayList<Float>(2); val ins = ArrayList<Float>(2); val outs = ArrayList<Float>(2); var gold = false
                   for (sgn in intArrayOf(-1, 1)) {
@@ -169,7 +169,7 @@ jobs:
                           } else i++
                       }
                       // anel grosso mais externo (+ borda interna do par)
-                      val thick = runs.filter { it.w >= 3 && it.c in 14f..128f }
+                      val thick = runs.filter { it.w >= 3 && it.c in 14f..(rmax - 12f) }
                       var ringC = Float.NaN
                       if (thick.isNotEmpty()) {
                           val ot = thick.maxByOrNull { it.c }!!
@@ -180,7 +180,7 @@ jobs:
                       }
                       // zona = par de círculos finos separados ~28..46 px. Escolhe o par mais próximo da zona anterior
                       // (a zona se move de forma contínua); sem histórico, o mais próximo do anel.
-                      val thin = runs.filter { it.w <= 2 && it.c in 14f..133f }.map { it.c }.sorted()
+                      val thin = runs.filter { it.w <= 2 && it.c in 14f..(rmax - 7f) }.map { it.c }.sorted()
                       var best: Pair<Float, Float>? = null; var bestScore = Float.MAX_VALUE
                       for (a in thin.indices) for (b in a + 1 until thin.size) {
                           val sep = thin[b] - thin[a]
@@ -239,9 +239,11 @@ jobs:
               private var lastT = 0L
               private var lastZoneSeen = 0L
               private var lastAnySeen = 0L
+              private var outliers = 0
+              private var armCount = 0
               var target = Float.NaN; private set
               val estimatedRing get() = r
-              fun currentMid(now: Long): Float = if (now - lastZoneSeen < 400) mid else Float.NaN
+              fun currentMid(now: Long): Float = if (now - lastZoneSeen < 900) mid else Float.NaN
 
               fun update(rd: Detector.Reading?, now: Long): Boolean {
                   val dt = if (lastT == 0L) 0.033f else ((now - lastT) / 1000f).coerceIn(0.005f, 0.2f)
@@ -249,19 +251,22 @@ jobs:
                   // 1) propaga o modelo do anel com o último comando
                   if (!r.isNaN()) {
                       val a = (if (hold) -40f else 43f) - 2.5f * v
-                      v += a * dt; r = (r + v * dt).coerceIn(0f, 170f)
+                      v += a * dt; r = (r + v * dt).coerceIn(0f, 195f)
                   }
                   if (rd != null) {
                       val hasR = !rd.ring.isNaN()
                       val hasI = !rd.inner.isNaN(); val hasO = !rd.outer.isNaN()
                       if (hasR || hasI || hasO) lastAnySeen = now
-                      if (hasR) {
+                      var ringOk = hasR
+                      if (hasR && !lastMeas.isNaN() && Math.abs(rd.ring - lastMeas) > 45f && outliers < 3) { ringOk = false; outliers++ }
+                      else if (hasR) outliers = 0
+                      if (ringOk) {
                           if (!lastMeas.isNaN()) {
                               val dm = ((rd.ring - lastMeas) / dt).coerceIn(-120f, 120f)
                               v = 0.5f * v + 0.5f * dm
                           }
                           lastMeas = rd.ring; r = rd.ring
-                      } else lastMeas = Float.NaN
+                      } else if (!hasR) lastMeas = Float.NaN
                       // 2) zona
                       var m = Float.NaN
                       if (hasI && hasO) { m = rd.inner + zonePos * (rd.outer - rd.inner); width = rd.outer - rd.inner }
@@ -275,12 +280,17 @@ jobs:
                           lastMid = m; mid = m; lastZoneSeen = now
                       }
                   }
+                  // zona fora de vista por pouco tempo (SURGE leva ela para longe): continua o movimento estimado
+                  if (lastZoneSeen != now && now - lastZoneSeen <= 900L && !mid.isNaN()) {
+                      mid = (mid + vZone * dt).coerceIn(10f, 185f); vZone *= 0.97f
+                  }
                   // 3) nada visível por um tempo (tela de resultado, menu): solta e zera
-                  if (now - lastAnySeen > 700) { hold = false; r = Float.NaN; v = 0f; vZone = 0f; target = Float.NaN; return hold }
-                  if (mid.isNaN() || r.isNaN()) return hold
+                  if (now - lastAnySeen > 700) { hold = false; r = Float.NaN; v = 0f; vZone = 0f; target = Float.NaN; armCount = 0; return hold }
+                  if (mid.isNaN() || r.isNaN()) { armCount = 0; return hold }
+                  if (armCount < 3) { armCount++; if (!hold) return false }
                   // 4) alvo: meio da zona, um pouco à frente do movimento dela
                   val ahead = (0.4f * vZone).coerceIn(-0.2f * width, 0.2f * width)
-                  target = mid + (if (now - lastZoneSeen < 400) ahead else 0f)
+                  target = mid + (if (now - lastZoneSeen < 900) ahead else 0f)
                   // Posição prevista: atraso (captura + toque + jogo) E distância de frenagem. Segurando, o anel
                   // chega a ~-50 px/s e continua caindo mesmo depois de soltar (medido: soltou em R~49 e foi a 20).
                   // Por isso o termo v*|v|/(2*BRAKE) — sem ele o anel entra no círculo interno e quebra (FAILED).
@@ -296,7 +306,7 @@ jobs:
                   return hold
               }
 
-              fun reset() { hold = false; r = Float.NaN; v = 0f; vZone = 0f; mid = Float.NaN; lastMid = Float.NaN; lastMeas = Float.NaN; lastT = 0L; lastAnySeen = 0L }
+              fun reset() { armCount = 0; outliers = 0; hold = false; r = Float.NaN; v = 0f; vZone = 0f; mid = Float.NaN; lastMid = Float.NaN; lastMeas = Float.NaN; lastT = 0L; lastAnySeen = 0L }
           }
           EOF_MB
           mkdir -p $(dirname app/src/main/java/com/manabot/BotAccessibilityService.kt)
