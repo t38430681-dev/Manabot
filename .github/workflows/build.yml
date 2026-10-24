@@ -1,4 +1,4 @@
-name: ManaBot Android Build v4
+name: Build APK
 on: [push, workflow_dispatch]
 jobs:
   build:
@@ -40,8 +40,8 @@ jobs:
                   applicationId = "com.manabot"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0-review"
+                  versionCode = 3
+                  versionName = "3.1-v4"
               }
               buildTypes { release { isMinifyEnabled = false } }
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
@@ -139,7 +139,7 @@ jobs:
               ): Reading? {
                   val cx = (cxFrac * w).toInt()
                   val cy = (cyFrac * h).toInt().coerceIn(1, h - 2)
-                  val rmax = 140
+                  val rmax = 160            // v3: 140 cortava a zona (O parava em 133) e o anel (128) nos SURGEs
                   if (cx - rmax < 0 || cx + rmax >= w) return null
                   val rg = ArrayList<Float>(2); val ins = ArrayList<Float>(2); val outs = ArrayList<Float>(2); var gold = false
                   for (sgn in intArrayOf(-1, 1)) {
@@ -174,14 +174,17 @@ jobs:
                           } else i++
                       }
                       // anel grosso mais externo (+ borda interna do par)
-                      val thick = runs.filter { it.w >= 3 && it.c in 14f..128f }
+                      val thick = runs.filter { it.w >= 3 && it.c in 14f..150f }
                       var ringC = Float.NaN
                       if (thick.isNotEmpty()) {
+                          // Sem histórico (ou salto), o anel é o mais externo até 128 px: acima disso só vale se vier
+                          // por continuidade (evita confundir detalhes da borda do disco com o anel).
+                          val base = thick.filter { it.c <= 128f }.ifEmpty { thick }
                           val chosen = if (prevRing.isFinite()) {
                               val nearest = thick.minByOrNull { Math.abs(it.c - prevRing) }!!
                               // Follow normal motion, but permit a large real radius jump during SURGE.
-                              if (Math.abs(nearest.c - prevRing) <= 24f) nearest else thick.maxByOrNull { it.c }!!
-                          } else thick.maxByOrNull { it.c }!!
+                              if (Math.abs(nearest.c - prevRing) <= 24f) nearest else base.maxByOrNull { it.c }!!
+                          } else base.maxByOrNull { it.c }!!
                           val paired = thick.filter { it !== chosen && Math.abs(it.c - chosen.c) <= 10f }
                               .minByOrNull { Math.abs(it.c - chosen.c) }
                           ringC = if (paired != null) (chosen.c + paired.c) / 2f else chosen.c
@@ -190,12 +193,14 @@ jobs:
                       }
                       // zona = par de círculos finos separados ~28..46 px. Escolhe o par mais próximo da zona anterior
                       // (a zona se move de forma contínua); sem histórico, o mais próximo do anel.
-                      val thin = runs.filter { it.w <= 2 && it.c in 14f..133f }.map { it.c }.sorted()
+                      val thin = runs.filter { it.w <= 2 && it.c in 14f..155f }.map { it.c }.sorted()
                       var best: Pair<Float, Float>? = null; var bestScore = Float.MAX_VALUE
                       for (a in thin.indices) for (b in a + 1 until thin.size) {
                           val sep = thin[b] - thin[a]
                           if (sep < 28f || sep > 46f) continue
                           val mid = (thin[a] + thin[b]) / 2f
+                          // continuidade: a zona anda < ~30 px/s; par muito longe da zona anterior é o círculo fixo do pentagrama (~31 px)
+                          if (!prevMid.isNaN() && Math.abs(mid - prevMid) > 18f) continue
                           val score = when {
                               !prevMid.isNaN() -> Math.abs(mid - prevMid)
                               !ringC.isNaN() -> Math.abs(mid - ringC)
@@ -223,11 +228,14 @@ jobs:
           mkdir -p $(dirname app/src/main/java/com/manabot/Controller.kt)
           cat > app/src/main/java/com/manabot/Controller.kt <<'EOF_MB'
           package com.manabot
-          
+
           import kotlin.math.abs
-          
-          /** Adaptive controller. Uses observed radius velocity and the measured capture/touch delay;
-           * avoids fixed, unverified acceleration constants and keeps the controlled ring inside the band. */
+
+          /** Controlador v4. Muda em relação à v3 só o que os vídeos mostraram estar errado:
+           *  - zona (par de círculos) some em ~30% dos quadros: agora é lembrada e extrapolada (até 1,2 s) em vez de soltar;
+           *  - par falso (círculo fixo do pentagrama, ~31 px) é rejeitado por continuidade (a zona se move < ~30 px/s);
+           *  - borda que some (anel encostado nela) é reconstruída com a largura lembrada (~40 px, constante);
+           *  - anel que some por instantes é estimado pelo modelo, em vez de soltar às cegas. */
           class Controller {
               var zonePos = 0.5f
               var leadSec = 0.18f
@@ -235,36 +243,49 @@ jobs:
               private var ring = Float.NaN
               private var velocity = 0f
               private var previousMeasurement = Float.NaN
+              private var lastRingSeen = 0L
               private var targetInner = Float.NaN
               private var targetOuter = Float.NaN
               private var zoneMid = Float.NaN
               private var zoneVelocity = 0f
-              private var previousZoneMid = Float.NaN
-              private var lastTime = 0L
+              private var zoneWidth = Float.NaN
+              private var lastMeasMid = Float.NaN
               private var lastZoneSeen = 0L
-              private var lastRingSeen = 0L
+              private var rejected = 0
+              private var lastTime = 0L
               private var lastAnySeen = 0L
               private var estimatedAcceleration = 0f
               var target = Float.NaN; private set
               val estimatedRing get() = ring
-          
-              /** Return the geometric zone midpoint for detector association, not the slider target. */
-              fun currentMid(now: Long): Float = if (now - lastZoneSeen < 300) zoneMid else Float.NaN
-              fun currentRing(): Float = ring
-          
+
+              /** Meio geométrico da zona (já extrapolado) para o detector associar o par certo; vale por 400 ms. */
+              fun currentMid(now: Long): Float = if (now - lastZoneSeen < 400) zoneMid else Float.NaN
+              fun currentRing(): Float = if (now0 - lastRingSeen < 400) ring else Float.NaN
+              private var now0 = 0L
+
               fun update(rd: Detector.Reading?, now: Long): Boolean {
+                  now0 = now
                   val dt = if (lastTime == 0L) 1f / 30f else ((now - lastTime) / 1000f).coerceIn(0.008f, 0.12f)
                   lastTime = now
                   val oldVelocity = velocity
-          
+
+                  // 1) prevê a zona (continua o movimento dela enquanto não há medida)
+                  val zoneAge = (now - lastZoneSeen) / 1000f
+                  if (zoneMid.isFinite() && zoneAge <= ZONE_HOLD_S) {
+                      val s = zoneVelocity * dt
+                      zoneMid += s; targetInner += s; targetOuter += s
+                      zoneVelocity *= 0.985f
+                  }
+
+                  var ringMeasured = false
                   if (rd != null) {
-                      val hasRing = rd.ring.isFinite() && rd.ring > 8f && rd.ring < 145f
-                      val hasInner = rd.inner.isFinite() && rd.inner > 35f
-                      val hasOuter = rd.outer.isFinite() && rd.outer > 35f
+                      val hasRing = rd.ring.isFinite() && rd.ring > 8f && rd.ring < 165f
+                      val hasInner = rd.inner.isFinite() && rd.inner > 10f
+                      val hasOuter = rd.outer.isFinite() && rd.outer > 10f
                       if (hasRing || hasInner || hasOuter) lastAnySeen = now
-          
+
                       if (hasRing) {
-                          if (previousMeasurement.isFinite()) {
+                          if (previousMeasurement.isFinite() && now - lastRingSeen < 300) {
                               val raw = ((rd.ring - previousMeasurement) / dt).coerceIn(-100f, 100f)
                               velocity = 0.58f * velocity + 0.42f * raw
                               val rawAccel = ((velocity - oldVelocity) / dt).coerceIn(-350f, 350f)
@@ -276,84 +297,100 @@ jobs:
                           previousMeasurement = rd.ring
                           ring = rd.ring
                           lastRingSeen = now
+                          ringMeasured = true
                       }
-          
-                      if (hasInner && hasOuter && rd.outer > rd.inner + 12f && rd.outer - rd.inner < 60f) {
-                          val newMid = (rd.inner + rd.outer) / 2f
-                          if (previousZoneMid.isFinite() && now - lastZoneSeen < 300) {
-                              val dz = ((newMid - previousZoneMid) / dt).coerceIn(-80f, 80f)
-                              // Sudden, plausible band shifts are allowed (SURGE); velocity is capped so a single
-                              // mis-detected frame cannot move the prediction hundreds of pixels.
-                              zoneVelocity = 0.65f * zoneVelocity + 0.35f * dz
-                          } else zoneVelocity = 0f
-                          previousZoneMid = newMid
-                          zoneMid = newMid
-                          targetInner = rd.inner
-                          targetOuter = rd.outer
-                          lastZoneSeen = now
-                      } else if (now - lastZoneSeen < 220L) {
-                          // One edge can disappear behind the avatar or effects. Reconstruct the missing edge
-                          // from the last valid width instead of swapping to a decorative circle.
-                          val oldWidth = if (targetInner.isFinite() && targetOuter.isFinite()) targetOuter - targetInner else Float.NaN
-                          if (oldWidth in 12f..60f && hasInner && !hasOuter) {
-                              targetInner = rd.inner
-                              targetOuter = rd.inner + oldWidth
-                              zoneMid = (targetInner + targetOuter) / 2f
-                              lastZoneSeen = now
-                          } else if (oldWidth in 12f..60f && hasOuter && !hasInner) {
-                              targetOuter = rd.outer
-                              targetInner = rd.outer - oldWidth
-                              zoneMid = (targetInner + targetOuter) / 2f
-                              lastZoneSeen = now
-                          }
-                      }
+                      measureZone(rd.inner.takeIf { hasInner } ?: Float.NaN, rd.outer.takeIf { hasOuter } ?: Float.NaN, now)
                   }
-          
+
+                  // 2) anel fora de vista por instantes (encostado na zona, laranja/vermelho, além do alcance): modelo
+                  if (!ringMeasured && ring.isFinite() && now - lastRingSeen < RING_HOLD_MS) {
+                      velocity += ((if (hold) -40f else 43f) - 2.5f * velocity) * dt
+                      ring = (ring + velocity * dt).coerceIn(0f, 200f)
+                  }
+
                   val ageAny = now - lastAnySeen
-                  val ageZone = now - lastZoneSeen
+                  val ageZone = (now - lastZoneSeen) / 1000f
                   val ageRing = now - lastRingSeen
-                  // Each signal has its own freshness clock: fresh zone edges must not hide a stale ring.
-                  // Release promptly whenever the controlled ring itself has not been measured recently.
-                  if (ageAny > 180L || ageZone > 220L || ageRing > 165L) {
-                      hold = false
-                      if (ageAny > 700L) reset()
-                      return false
-                  }
-                  if (!ring.isFinite() || !targetInner.isFinite() || !targetOuter.isFinite()) {
+                  if (ageAny > 700L) { reset(); return false }
+                  if (ageZone > ZONE_HOLD_S || ageRing > RING_HOLD_MS || !ring.isFinite() || !zoneMid.isFinite()) {
                       hold = false
                       return false
                   }
-          
+
+                  // 3) decisão (igual à v3, com folga maior nas bordas: o anel fica laranja a ~5 px da borda interna)
                   val delay = leadSec.coerceIn(0f, 0.5f)
-                  val predictedRing = (ring + velocity * delay + 0.5f * estimatedAcceleration * delay * delay)
+                  val predictedRing = ring + velocity * delay + 0.5f * estimatedAcceleration * delay * delay
                   val width = (targetOuter - targetInner).coerceIn(12f, 60f)
                   val predictedZoneShift = (zoneVelocity * delay).coerceIn(-width * 0.65f, width * 0.65f)
                   val predictedInner = targetInner + predictedZoneShift
                   val predictedOuter = targetOuter + predictedZoneShift
                   target = predictedInner + zonePos.coerceIn(0.05f, 0.95f) * (predictedOuter - predictedInner)
-          
-                  // Hysteresis scales slightly with speed but never consumes the full safe band.
+
                   val margin = (abs(velocity) * delay * 0.12f + 1.2f).coerceIn(1.2f, minOf(4.0f, width * 0.18f))
-                  val innerSafety = predictedInner + maxOf(3f, width * 0.12f)
-                  val outerSafety = predictedOuter - maxOf(3f, width * 0.12f)
-          
+                  val innerSafety = predictedInner + maxOf(INNER_SAFE, width * 0.2f)
+                  val outerSafety = predictedOuter - maxOf(OUTER_SAFE, width * 0.12f)
                   when {
-                      predictedRing <= innerSafety -> hold = false // release makes the ring grow
-                      predictedRing >= outerSafety -> hold = true // hold makes the ring shrink
+                      predictedRing <= innerSafety -> hold = false
+                      predictedRing >= outerSafety -> hold = true
                       predictedRing > target + margin -> hold = true
                       predictedRing < target - margin -> hold = false
-                      // Inside the dead band, preserve the command to avoid rapid gesture chatter.
                   }
                   return hold
               }
-          
+
+              private fun measureZone(inner: Float, outer: Float, now: Long) {
+                  val age = ((now - lastZoneSeen) / 1000f).coerceAtMost(2f)
+                  val known = zoneMid.isFinite() && age <= ZONE_HOLD_S
+                  val widthKnown = zoneWidth.isFinite()
+                  var cInner = Float.NaN; var cOuter = Float.NaN
+                  var pair = false
+                  if (inner.isFinite() && outer.isFinite()) {
+                      val w = outer - inner
+                      if (w in 12f..60f && (!widthKnown || !known || abs(w - zoneWidth) <= 10f)) { cInner = inner; cOuter = outer; pair = true }
+                      else if (known && widthKnown) {
+                          // largura incoerente: fica com a borda mais perto do esperado e reconstrói a outra
+                          val eIn = abs(inner - (zoneMid - zoneWidth / 2)); val eOut = abs(outer - (zoneMid + zoneWidth / 2))
+                          if (eIn <= eOut) { cInner = inner; cOuter = inner + zoneWidth } else { cOuter = outer; cInner = outer - zoneWidth }
+                      }
+                  } else if (known && widthKnown) {
+                      if (inner.isFinite()) { cInner = inner; cOuter = inner + zoneWidth }
+                      else if (outer.isFinite()) { cOuter = outer; cInner = outer - zoneWidth }
+                  }
+                  if (!cInner.isFinite()) return
+                  val mid = (cInner + cOuter) / 2f
+                  if (known) {
+                      val gate = 12f + 30f * age
+                      if (abs(mid - zoneMid) > gate) {
+                          // salto maior que a zona consegue andar: leitura falsa (ex.: círculo do pentagrama). Só aceita se persistir.
+                          rejected++
+                          if (rejected < 5) return
+                      }
+                  }
+                  rejected = 0
+                  if (lastMeasMid.isFinite() && (now - lastZoneSeen) < 300L) {
+                      val dz = ((mid - lastMeasMid) / ((now - lastZoneSeen) / 1000f).coerceAtLeast(0.016f)).coerceIn(-60f, 60f)
+                      zoneVelocity = 0.65f * zoneVelocity + 0.35f * dz
+                  } else zoneVelocity = 0f
+                  if (pair) zoneWidth = if (widthKnown) 0.9f * zoneWidth + 0.1f * (cOuter - cInner) else (cOuter - cInner)
+                  lastMeasMid = mid
+                  zoneMid = mid; targetInner = cInner; targetOuter = cOuter
+                  lastZoneSeen = now
+              }
+
               fun reset() {
                   hold = false
-                  ring = Float.NaN; velocity = 0f; previousMeasurement = Float.NaN
+                  ring = Float.NaN; velocity = 0f; previousMeasurement = Float.NaN; lastRingSeen = 0L
                   targetInner = Float.NaN; targetOuter = Float.NaN; zoneMid = Float.NaN
-                  zoneVelocity = 0f; previousZoneMid = Float.NaN
-                  lastTime = 0L; lastZoneSeen = 0L; lastRingSeen = 0L; lastAnySeen = 0L
+                  zoneVelocity = 0f; zoneWidth = Float.NaN; lastMeasMid = Float.NaN
+                  lastTime = 0L; lastZoneSeen = 0L; lastAnySeen = 0L; rejected = 0
                   estimatedAcceleration = 0f; target = Float.NaN
+              }
+
+              companion object {
+                  const val ZONE_HOLD_S = 1.2f
+                  const val RING_HOLD_MS = 600L
+                  const val INNER_SAFE = 8f
+                  const val OUTER_SAFE = 5f
               }
           }
           EOF_MB
@@ -534,7 +571,7 @@ jobs:
               private fun loadCfg() {
                   val p = getSharedPreferences("cfg", MODE_PRIVATE)
                   controller.zonePos = p.getFloat("gap", 50f) / 100f
-                  controller.leadSec = p.getFloat("lead2", 260f) / 1000f
+                  controller.leadSec = p.getFloat("lead3", 260f) / 1000f
                   cx = p.getFloat("cx", 49.9f) / 100f; cy = p.getFloat("cy", 49.8f) / 100f
                   tx = p.getFloat("tx", 68f) / 100f; ty = p.getFloat("ty", 60f) / 100f
               }
@@ -682,7 +719,7 @@ jobs:
                       root.addView(tv); root.addView(sb)
                   }
                   slider("Posição na zona (0=interno, 100=externo)", "gap", 0f, 100f, 50f, " %")
-                  slider("Antecipação (atraso captura/toque)", "lead2", 40f, 350f, 180f, " ms")
+                  slider("Antecipação (atraso captura/toque)", "lead3", 40f, 400f, 260f, " ms")
                   slider("Centro do círculo X", "cx", 40f, 60f, 49.9f, " %")
                   slider("Centro do círculo Y", "cy", 40f, 60f, 49.8f, " %")
                   slider("Ponto de toque X", "tx", 55f, 78f, 68f, " %")
@@ -746,6 +783,62 @@ jobs:
                   assertNull(Detector.analyze(ByteBuffer.allocate(w * h * 4), w * 4, 4, w, h, .536f, .517f))
               }
           
+              private fun frameWithCircles(w: Int, h: Int, cxf: Float, cyf: Float, thin: List<Float>, ringR: Float): ByteBuffer {
+                  val buffer = ByteBuffer.allocate(w * h * 4)
+                  val cx = cxf * w; val cy = cyf * h
+                  for (y in 0 until h) for (x in 0 until w) {
+                      val i = (y * w + x) * 4
+                      val radius = sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy))
+                      var rr = 20; var gg = 20; var bb = 20
+                      if (thin.any { Math.abs(radius - it) < 1.0 }) { rr = 245; gg = 245; bb = 245 }
+                      if (Math.abs(radius - ringR) < 3.0) { rr = 245; gg = 245; bb = 250 }
+                      buffer.put(i, rr.toByte()); buffer.put(i + 1, gg.toByte()); buffer.put(i + 2, bb.toByte()); buffer.put(i + 3, 255.toByte())
+                  }
+                  return buffer
+              }
+
+              @Test fun rejectsPentagramCirclePairAndKeepsRealZone() {
+                  val w = 1068; val h = 600
+                  // zona real (72..112, meio 92) escondida pelo anel; so aparecem o circulo fixo do pentagrama (31) e um circulo
+                  // solto em 74. O par (31,74) tem largura plausivel (43) mas meio 52, ~40 px da zona anterior: e falso.
+                  val frame = frameWithCircles(w, h, .5f, .5f, listOf(31f, 74f), 90f)
+                  val r = Detector.analyze(frame, w * 4, 4, w, h, .5f, .5f, 92f, 90f)
+                  assertNotNull(r)
+                  assertTrue("inner=${r!!.inner}", r.inner.isNaN() || r.inner > 60f)
+              }
+
+              @Test fun seesZoneAndRingBeyondOldLimit() {
+                  val w = 1068; val h = 600
+                  // zona 115..155 e anel em 140: a v3 cortava em 133/128 e perdia tudo isso
+                  val frame = frameWithCircles(w, h, .5f, .5f, listOf(115f, 155f), 140f)
+                  val r = Detector.analyze(frame, w * 4, 4, w, h, .5f, .5f, 135f, 140f)
+                  assertNotNull(r)
+                  assertTrue("ring=${r!!.ring}", r.ring in 136f..144f)
+                  assertTrue("outer=${r.outer}", r.outer in 152f..158f)
+              }
+
+              @Test fun controllerKeepsControllingThroughZoneDropout() {
+                  val controller = Controller().apply { leadSec = .1f; zonePos = .5f }
+                  var now = 1_000L
+                  repeat(10) { controller.update(Detector.Reading(95f, 69f, 109f, false, 1f), now); now += 33L }
+                  // zona some por 0,5 s com o anel acima do alvo: tem de continuar SEGURANDO, nao soltar
+                  var hold = false
+                  repeat(15) { hold = controller.update(Detector.Reading(95f, Float.NaN, Float.NaN, false, .3f), now); now += 33L }
+                  assertTrue("deveria continuar segurando sem a zona", hold)
+                  // zona some por mais de 1,2 s: solta
+                  repeat(45) { hold = controller.update(Detector.Reading(95f, Float.NaN, Float.NaN, false, .3f), now); now += 33L }
+                  assertFalse(hold)
+              }
+
+              @Test fun controllerIgnoresFalsePairJump() {
+                  val controller = Controller().apply { leadSec = .1f; zonePos = .5f }
+                  var now = 1_000L
+                  repeat(10) { controller.update(Detector.Reading(95f, 72f, 112f, false, 1f), now); now += 33L }
+                  // 3 quadros com par falso (31, 63): nao pode puxar o alvo para ~47
+                  repeat(3) { controller.update(Detector.Reading(95f, 31f, 63f, false, 1f), now); now += 33L }
+                  assertTrue("alvo=${controller.target}", controller.target > 80f)
+              }
+
               @Test fun controllerKeepsRingNearBandAndReleasesWhenStale() {
                   val controller = Controller().apply { leadSec = .1f; zonePos = .5f }
                   var now = 1_000L
@@ -760,20 +853,6 @@ jobs:
                   assertTrue("radius drifted outside the safe test band: $radius", radius in 62f..99f)
                   assertFalse(controller.update(null, now + 1_000L))
               }
-          
-              @Test fun freshZoneCannotMaskStaleControlledRing() {
-                  val controller = Controller().apply { leadSec = .1f; zonePos = .5f }
-                  var now = 10_000L
-                  val valid = Detector.Reading(80f, 69f, 92f, false, 1f)
-                  controller.update(valid, now)
-                  // The zone remains visible, but the controlled ring detector has lost the ring.
-                  repeat(7) {
-                      now += 33L
-                      controller.update(Detector.Reading(Float.NaN, 69f, 92f, false, .5f), now)
-                  }
-                  assertFalse("controller must release when ring measurements go stale", controller.update(Detector.Reading(Float.NaN, 69f, 92f, false, .5f), now + 1L))
-              }
-          
           }
           EOF_MB
       - uses: actions/setup-java@v4
@@ -787,5 +866,5 @@ jobs:
       - name: Compilar APK
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
-        with: { name: ManaBot-v4-apk, path: app/build/outputs/apk/debug/app-debug.apk }
+        with: { name: ManaBot-apk, path: app/build/outputs/apk/debug/app-debug.apk }
 
